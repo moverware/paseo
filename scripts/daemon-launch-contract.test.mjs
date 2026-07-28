@@ -37,7 +37,7 @@ test("every executable daemon entrypoint enters the supervisor", async () => {
     nixPackage,
   ] = await Promise.all([
     readFile(join(repoRoot, "packages/server/package.json"), "utf8"),
-    readFile(join(repoRoot, "packages/app/e2e/global-setup.ts"), "utf8"),
+    readFile(join(repoRoot, "packages/app/e2e/support/global-setup.ts"), "utf8"),
     readFile(
       join(repoRoot, "packages/server/src/server/daemon-e2e/connection-offer.e2e.test.ts"),
       "utf8",
