@@ -22,6 +22,9 @@ interface AgentInspect {
   ArchivedAt: string | null;
   Mode: string;
   Cwd: string;
+  SessionId: string | null;
+  WorkspaceId: string | null;
+  Labels: Record<string, string>;
   CreatedAt: string;
   UpdatedAt: string;
   LastUsage: {
@@ -136,6 +139,9 @@ function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
     Status: snapshot.status,
     Archived: snapshot.archivedAt != null,
     ArchivedAt: snapshot.archivedAt ?? null,
+    SessionId: snapshot.persistence?.sessionId ?? snapshot.runtimeInfo?.sessionId ?? null,
+    WorkspaceId: snapshot.workspaceId ?? null,
+    Labels: snapshot.labels ?? {},
     Mode: snapshot.currentModeId ?? "default",
     Cwd: snapshot.cwd,
     CreatedAt: snapshot.createdAt,
@@ -167,6 +173,8 @@ function toInspectRows(agent: AgentInspect): InspectRow[] {
     { key: "ArchivedAt", value: agent.ArchivedAt ?? "null" },
     { key: "Mode", value: agent.Mode },
     { key: "Cwd", value: shortenPath(agent.Cwd) },
+    { key: "SessionId", value: agent.SessionId ?? "null" },
+    { key: "WorkspaceId", value: agent.WorkspaceId ?? "null" },
     { key: "CreatedAt", value: agent.CreatedAt },
     { key: "UpdatedAt", value: agent.UpdatedAt },
   ];

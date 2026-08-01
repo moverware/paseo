@@ -12,6 +12,10 @@ export function addImportOptions(cmd: Command): Command {
     .requiredOption("--provider <provider>", "Agent provider id")
     .option("--cwd <path>", "Working directory for providers that require it")
     .option(
+      "--workspace <id>",
+      "Target workspace id — file the agent there instead of minting a new auto-created workspace",
+    )
+    .option(
       "--label <key=value>",
       "Add label(s) to the agent (can be used multiple times)",
       collectMultiple,
@@ -22,6 +26,7 @@ export function addImportOptions(cmd: Command): Command {
 export interface AgentImportOptions extends CommandOptions {
   provider?: string;
   cwd?: string;
+  workspace?: string;
   label?: string[];
   host?: string;
 }
@@ -136,6 +141,7 @@ export async function runImportCommand(
       provider,
       sessionId,
       cwd,
+      ...(options.workspace?.trim() ? { workspaceId: options.workspace.trim() } : {}),
       ...(Object.keys(labels).length > 0 ? { labels } : {}),
     });
 
