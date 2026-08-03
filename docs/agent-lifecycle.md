@@ -24,6 +24,27 @@ primed.
 Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
 action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
 
+### External turns
+
+An imported agent's turns may run in an external process the daemon never sees — a terminal pane
+driving the provider CLI against the same durable session. Three mechanisms make those turns behave
+like daemon-run turns; all live in `agent-manager.ts` unless noted:
+
+- The transcript tailer (`transcript-tailer.ts`) watches the provider-owned transcript of every
+  registered session and broadcasts appended lines through the normal timeline commit + `agent_stream`
+  path. Providers opt in with `externalTranscriptPath` / `convertExternalTranscriptLines` on their
+  session (Claude only today). Tailing pauses while a daemon-side run is in flight and resyncs when
+  runs settle, so daemon-run turns never double-emit.
+- `externalTurnUntil` projects status `running` while an external turn is active. It is fed by tail
+  activity (90-second decay) and by explicit reports: `update_agent_request.externalTurn`
+  (`paseo agent update --external-turn running|idle`), for the external process's own lifecycle hooks.
+  Projection-only — `lastStatus` on disk keeps the lifecycle, so restarts never resurrect a stale
+  `running`.
+- A cancel request with no daemon-side run spawns `daemon.externalInterruptCommand` from config
+  (argv array; receives `PASEO_AGENT_ID`, `PASEO_AGENT_SESSION_ID`, `PASEO_AGENT_CWD`,
+  `PASEO_AGENT_LABELS`) so the stop button can reach the external process. Unset means the previous
+  no-op behavior.
+
 ### Cancellation
 
 Cancellation changes lifecycle state only after the provider acknowledges the interrupt or emits a terminal turn event. If the interrupt is rejected or times out, the agent remains `running` with its active foreground turn intact. Follow-up actions such as replacement, reload, rewind, and Stop must report that failure instead of accepting work they cannot perform. Synthesizing a local cancellation without provider acknowledgment creates a split-brain session: Paseo accepts a new prompt while the provider still owns the previous foreground turn.
