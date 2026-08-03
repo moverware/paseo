@@ -251,6 +251,9 @@ export const PersistedConfigSchema = z
         autoArchiveAfterMerge: z.boolean().optional(),
         enableTerminalAgentHooks: z.boolean().optional(),
         appendSystemPrompt: z.string().optional(),
+        // Argv array run to interrupt an agent turn executing in an external
+        // process (terminal pane CLI). See AgentManagerOptions.externalInterruptCommand.
+        externalInterruptCommand: z.array(z.string()).optional(),
         terminalProfiles: z.array(TerminalProfileSchema).optional(),
         cors: z
           .object({

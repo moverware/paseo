@@ -103,6 +103,7 @@ import {
   type AgentRuntimeInfo,
   type FetchCatalogOptions,
   type ImportableProviderSession,
+  type ImportedTimelineEntry,
   type ImportProviderSessionContext,
   type ImportProviderSessionInput,
   type ListImportableSessionsOptions,
@@ -2251,6 +2252,21 @@ class ClaudeAgentSession implements AgentSession {
       };
     }
     yield* providerSubagentEvents;
+  }
+
+  externalTranscriptPath(): string | null {
+    if (!this.claudeSessionId) {
+      return null;
+    }
+    return this.resolveHistoryPath(this.claudeSessionId);
+  }
+
+  convertExternalTranscriptLines(content: string): ImportedTimelineEntry[] {
+    const timeline: PersistedTimelineEntry[] = [];
+    for (const line of content.split(/\r?\n/)) {
+      this.ingestPersistedHistoryLine(line, timeline);
+    }
+    return timeline;
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {

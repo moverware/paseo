@@ -45,6 +45,9 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   inFlightAgentIds = new Set<string>();
   readonly settledDuringCancellationAgentIds = new Set<string>();
   readonly rejectedCancellationAgentIds = new Set<string>();
+  readonly externalTurnAgentIds = new Set<string>();
+  readonly externalInterruptAgentIds: string[] = [];
+  readonly externalTurnReports: Array<{ agentId: string; state: "running" | "idle" }> = [];
 
   constructor(private readonly storage: FakeLifecycleAgentStorage) {}
 
@@ -54,6 +57,18 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
 
   hasInFlightRun(agentId: string): boolean {
     return this.inFlightAgentIds.has(agentId);
+  }
+
+  interruptExternalTurn(agentId: string): boolean {
+    if (!this.externalTurnAgentIds.has(agentId)) {
+      return false;
+    }
+    this.externalInterruptAgentIds.push(agentId);
+    return true;
+  }
+
+  reportExternalTurn(agentId: string, state: "running" | "idle"): void {
+    this.externalTurnReports.push({ agentId, state });
   }
 
   async cancelAgentRun(agentId: string) {
@@ -179,6 +194,38 @@ describe("agent lifecycle commands", () => {
     expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
   });
 
+  test("routes a stop to the external turn when no daemon run is in flight", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "idle"));
+    manager.externalTurnAgentIds.add("agent-1");
+
+    const result = await cancelAgentRunCommand({ agentManager: manager, logger }, "agent-1");
+
+    expect(result).toEqual({
+      agent: manager.liveAgents.get("agent-1"),
+      cancelled: true,
+    });
+    expect(manager.cancelledAgentIds).toEqual([]);
+    expect(manager.externalInterruptAgentIds).toEqual(["agent-1"]);
+  });
+
+  test("forwards externalTurn reports through updateAgentCommand", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "idle"));
+
+    await expect(
+      updateAgentCommand(
+        { agentManager: manager },
+        { agentId: "agent-1", externalTurn: "running" },
+      ),
+    ).resolves.toEqual({ accepted: true, error: null });
+
+    expect(manager.externalTurnReports).toEqual([{ agentId: "agent-1", state: "running" }]);
+    expect(manager.metadataUpdates).toEqual([]);
+  });
+
   test("accepts a stop when the run settles during cancellation", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
@@ -269,7 +316,7 @@ describe("agent lifecycle commands", () => {
       updateAgentCommand({ agentManager: manager }, { agentId: "agent-1", name: "   " }),
     ).resolves.toEqual({
       accepted: false,
-      error: "Nothing to update (provide name and/or labels)",
+      error: "Nothing to update (provide name, labels and/or externalTurn)",
     });
 
     expect(storage.upserts).toHaveLength(0);

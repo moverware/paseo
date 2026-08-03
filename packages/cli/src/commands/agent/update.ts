@@ -35,6 +35,7 @@ export interface AgentUpdateOptions extends CommandOptions {
   name?: string;
   label?: string[];
   thinking?: string;
+  externalTurn?: string;
   host?: string;
 }
 
@@ -43,6 +44,7 @@ export type AgentUpdateCommandResult = SingleResult<AgentUpdateResult>;
 export interface AgentMetadataChanges {
   name?: string;
   labels?: Record<string, string>;
+  externalTurn?: "running" | "idle";
 }
 
 interface AgentUpdateServerInfo {
@@ -149,6 +151,18 @@ function formatLabels(labels: Record<string, string>): string {
   return entries.map(([key, value]) => `${key}=${value}`).join(",");
 }
 
+function parseExternalTurnOption(value: string | undefined): "running" | "idle" | undefined {
+  const externalTurn = value?.trim();
+  if (externalTurn === undefined || externalTurn === "running" || externalTurn === "idle") {
+    return externalTurn;
+  }
+  throw {
+    code: "INVALID_EXTERNAL_TURN",
+    message: `Invalid --external-turn value: ${externalTurn}`,
+    details: "Use --external-turn running or --external-turn idle",
+  } satisfies CommandError;
+}
+
 function parseAgentChanges(options: AgentUpdateOptions): AgentChanges {
   const name = options.name?.trim();
   if (options.name !== undefined && !name) {
@@ -170,11 +184,14 @@ function parseAgentChanges(options: AgentUpdateOptions): AgentChanges {
     } satisfies CommandError;
   }
 
-  const hasMetadataUpdates = Boolean(name) || Object.keys(labels).length > 0;
+  const externalTurn = parseExternalTurnOption(options.externalTurn);
+
+  const hasMetadataUpdates =
+    Boolean(name) || Object.keys(labels).length > 0 || Boolean(externalTurn);
   if (hasMetadataUpdates && thinkingOptionId) {
     throw {
       code: "INVALID_OPTIONS",
-      message: "--thinking cannot be combined with --name or --label",
+      message: "--thinking cannot be combined with --name, --label or --external-turn",
       details: "Run separate agent update commands for runtime settings and metadata.",
     } satisfies CommandError;
   }
@@ -182,7 +199,8 @@ function parseAgentChanges(options: AgentUpdateOptions): AgentChanges {
     throw {
       code: "NO_CHANGES_PROVIDED",
       message: "Nothing to update",
-      details: "Provide at least one of: --name <name>, --label <key=value>, --thinking <id>",
+      details:
+        "Provide at least one of: --name <name>, --label <key=value>, --thinking <id>, --external-turn <state>",
     } satisfies CommandError;
   }
 
@@ -194,6 +212,7 @@ function parseAgentChanges(options: AgentUpdateOptions): AgentChanges {
     updates: {
       ...(name ? { name } : {}),
       ...(Object.keys(labels).length > 0 ? { labels } : {}),
+      ...(externalTurn ? { externalTurn } : {}),
     },
   };
 }

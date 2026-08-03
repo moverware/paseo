@@ -101,6 +101,10 @@ export function createAgentCommand(): Command {
         "Add/set label(s) on the agent (can be used multiple times or comma-separated)",
         collectMultiple,
         [],
+      )
+      .option(
+        "--external-turn <state>",
+        "Report the state of a turn running outside the daemon: running or idle",
       ),
   ).action(withOutput(runUpdateCommand));
 

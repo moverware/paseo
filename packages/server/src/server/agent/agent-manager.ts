@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { stat } from "node:fs/promises";
@@ -60,6 +61,7 @@ import {
   AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
   AgentStreamCoalescer,
 } from "./agent-stream-coalescer.js";
+import { TranscriptTailer } from "./transcript-tailer.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import { AgentRunState, type ForegroundTurnWaiter } from "./agent-run-state.js";
 import { getAgentProviderDefinition } from "@getpaseo/protocol/provider-manifest";
@@ -76,6 +78,12 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+/**
+ * How long external-turn activity keeps an agent projected as running without
+ * a fresh signal. Backstop only: explicit idle reports end the turn crisply,
+ * and tail activity refreshes the window while lines keep arriving.
+ */
+const EXTERNAL_TURN_DECAY_MS = 90_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -254,6 +262,13 @@ export interface AgentManagerOptions {
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
+  /**
+   * Command to interrupt a turn running in an external process (argv array).
+   * Invoked on cancel requests for agents whose external turn is active while
+   * the daemon holds no run. Receives PASEO_AGENT_ID, PASEO_AGENT_SESSION_ID,
+   * PASEO_AGENT_CWD and PASEO_AGENT_LABELS (JSON) in its environment.
+   */
+  externalInterruptCommand?: string[];
   logger: Logger;
 }
 
@@ -343,6 +358,16 @@ interface ManagedAgentBase {
    * User-defined labels for categorizing agents (e.g., { surface: "workspace" }).
    */
   labels: Record<string, string>;
+  /**
+   * Epoch ms until which a turn run by an EXTERNAL process (the provider CLI
+   * in a terminal pane) counts as active. Fed by transcript-tail activity and
+   * by explicit reports (update_agent_request externalTurn); projected as
+   * status "running" while the daemon-side lifecycle stays idle, so clients
+   * offer stop/queue affordances for turns the daemon is not executing.
+   * Never persisted — a restart forgets it, and the next report or tail
+   * activity re-establishes it.
+   */
+  externalTurnUntil: number | null;
 }
 
 type ManagedAgentWithSession = ManagedAgentBase & {
@@ -437,6 +462,12 @@ interface SubscriptionRecord {
 }
 
 const BUSY_STATUSES: Set<AgentLifecycleStatus> = new Set(["initializing", "running"]);
+
+/** True while a turn run by an external process counts as active for this
+ * agent (see ManagedAgentBase.externalTurnUntil). */
+export function isExternalTurnActive(agent: { externalTurnUntil: number | null }): boolean {
+  return agent.externalTurnUntil !== null && agent.externalTurnUntil > Date.now();
+}
 const AgentIdSchema = z.guid();
 
 function isAgentBusy(status: AgentLifecycleStatus): boolean {
@@ -583,6 +614,9 @@ export class AgentManager {
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
+  private readonly transcriptTailer: TranscriptTailer;
+  private readonly externalInterruptCommand: string[] | null;
+  private readonly externalTurnExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -608,6 +642,14 @@ export class AgentManager {
       onFlush: ({ agentId, item, provider, turnId }) => {
         const event = this.recordAndDispatchTimelineItem(agentId, item, provider, turnId);
         this.notifyForegroundTurnWaiters(agentId, event);
+      },
+    });
+    this.externalInterruptCommand = options.externalInterruptCommand ?? null;
+    this.transcriptTailer = new TranscriptTailer({
+      logger: this.logger,
+      hasInFlightRun: (agentId) => this.hasInFlightRun(agentId),
+      emitEntries: (agentId, entries) => {
+        this.appendExternalTimelineEntries(agentId, entries);
       },
     });
     this.updateProviderRegistry({
@@ -1534,6 +1576,7 @@ export class AgentManager {
         attention: { requiresAttention: false },
         internal: record.internal,
         labels: record.labels,
+        externalTurnUntil: null,
       },
     });
   }
@@ -1909,6 +1952,135 @@ export class AgentManager {
     return true;
   }
 
+  /**
+   * Commit and broadcast timeline entries the transcript tailer read from a
+   * turn run by an external process (e.g. the provider CLI in a terminal
+   * pane). Same persistence + broadcast pipeline as daemon-run turns, so
+   * clients render external turns live.
+   */
+  private appendExternalTimelineEntries(
+    agentId: string,
+    entries: readonly ImportedTimelineEntry[],
+  ): void {
+    const agent = this.agents.get(agentId);
+    if (!agent || agent.session == null) {
+      return;
+    }
+    if (this.hasInFlightRun(agentId)) {
+      return;
+    }
+    let recorded = false;
+    for (const entry of entries) {
+      if (entry.item.type === "user_message" && isSystemInjectedEnvelope(entry.item.text)) {
+        continue;
+      }
+      const row = this.recordTimeline(
+        agentId,
+        entry.item,
+        entry.timestamp ? { timestamp: entry.timestamp } : undefined,
+      );
+      this.dispatchStream(
+        agentId,
+        { type: "timeline", item: row.item, provider: agent.provider },
+        {
+          seq: row.seq,
+          epoch: this.timelineStore.getEpoch(agentId),
+          timestamp: row.timestamp,
+        },
+      );
+      recorded = true;
+    }
+    if (recorded) {
+      this.setExternalTurnUntil(agent, Date.now() + EXTERNAL_TURN_DECAY_MS);
+      this.touchUpdatedAt(agent);
+      this.emitState(agent);
+    }
+  }
+
+  /**
+   * Explicit external-turn report (update_agent_request externalTurn), sent by
+   * the external process's own lifecycle hooks. Crisper than tail-activity
+   * decay: "running" arrives with the prompt, "idle" the moment the turn ends,
+   * so clients flip stop/queue affordances without waiting out the decay.
+   */
+  reportExternalTurn(agentId: string, state: "running" | "idle"): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      return;
+    }
+    this.setExternalTurnUntil(
+      agent,
+      state === "running" ? Date.now() + EXTERNAL_TURN_DECAY_MS : null,
+    );
+    this.emitState(agent, { persist: false });
+  }
+
+  /**
+   * Ask the external process running this agent's turn to interrupt it, via
+   * the configured command. Returns true when the command was launched.
+   */
+  interruptExternalTurn(agentId: string): boolean {
+    const agent = this.agents.get(agentId);
+    if (!agent || !this.externalInterruptCommand || this.externalInterruptCommand.length === 0) {
+      return false;
+    }
+    if (!isExternalTurnActive(agent)) {
+      return false;
+    }
+    const [command, ...args] = this.externalInterruptCommand;
+    try {
+      const child = spawn(command, args, {
+        env: {
+          ...process.env,
+          PASEO_AGENT_ID: agent.id,
+          PASEO_AGENT_SESSION_ID: agent.persistence?.sessionId ?? "",
+          PASEO_AGENT_CWD: agent.cwd,
+          PASEO_AGENT_LABELS: JSON.stringify(agent.labels),
+        },
+        stdio: "ignore",
+        detached: false,
+      });
+      child.on("error", (error) => {
+        this.logger.warn({ err: error, agentId }, "external interrupt command failed to spawn");
+      });
+      child.on("exit", (code) => {
+        if (code !== 0) {
+          this.logger.warn({ agentId, code }, "external interrupt command exited non-zero");
+        }
+      });
+    } catch (error) {
+      this.logger.warn({ err: error, agentId }, "external interrupt command failed");
+      return false;
+    }
+    this.logger.info({ agentId }, "external interrupt command launched");
+    return true;
+  }
+
+  private setExternalTurnUntil(agent: ManagedAgent, until: number | null): void {
+    agent.externalTurnUntil = until;
+    const existingTimer = this.externalTurnExpiryTimers.get(agent.id);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.externalTurnExpiryTimers.delete(agent.id);
+    }
+    if (until === null) {
+      return;
+    }
+    // Broadcast the flip back to idle when the decay lapses with no further
+    // activity — nothing else emits state at that moment.
+    const timer = setTimeout(
+      () => {
+        this.externalTurnExpiryTimers.delete(agent.id);
+        const current = this.agents.get(agent.id);
+        if (current && !isExternalTurnActive(current)) {
+          this.emitState(current, { persist: false });
+        }
+      },
+      Math.max(0, until - Date.now()) + 100,
+    );
+    this.externalTurnExpiryTimers.set(agent.id, timer);
+  }
+
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
     const agent = this.requireAgent(agentId);
     item = limitAgentTimelineItemContent(item);
@@ -1997,6 +2169,7 @@ export class AgentManager {
         });
         this.finalizeForegroundTurn(agent);
         this.runs.settleForegroundRun(agentId, pendingRun.token);
+        this.transcriptTailer.resyncAfterRun(agentId);
         throw error;
       }
 
@@ -2033,6 +2206,7 @@ export class AgentManager {
           this.runs.deleteWaiter(agent, turnStream.waiter);
         }
         this.runs.settleForegroundRun(agentId, pendingRun.token);
+        this.transcriptTailer.resyncAfterRun(agentId);
         if (!agent.activeForegroundTurnId) {
           await this.refreshRuntimeInfo(agent);
         }
@@ -2401,6 +2575,7 @@ export class AgentManager {
       throw error;
     } finally {
       this.runs.settleForegroundRun(agentId, lock.token);
+      this.transcriptTailer.resyncAfterRun(agentId);
     }
   }
 
@@ -2730,6 +2905,7 @@ export class AgentManager {
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
       this.subscribeToSession(managed);
+      this.transcriptTailer.arm(managed.id, managed.session);
       return { ...managed };
     } catch (error) {
       if (!registered) {
@@ -2853,6 +3029,7 @@ export class AgentManager {
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
       labels: options?.labels ?? {},
+      externalTurnUntil: null,
     } as ActiveManagedAgent;
   }
 
@@ -2874,6 +3051,12 @@ export class AgentManager {
     agent: LiveManagedAgent,
     cancelReason: string,
   ): ManagedAgentClosed {
+    this.transcriptTailer.disarm(agent.id);
+    const externalTurnTimer = this.externalTurnExpiryTimers.get(agent.id);
+    if (externalTurnTimer) {
+      clearTimeout(externalTurnTimer);
+      this.externalTurnExpiryTimers.delete(agent.id);
+    }
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
     this.previousStatuses.delete(agent.id);
@@ -2900,6 +3083,7 @@ export class AgentManager {
       foregroundTurnWaiters: new Set(),
       finalizedForegroundTurnIds: new Set(),
       unsubscribeSession: null,
+      externalTurnUntil: null,
     };
   }
 
@@ -3339,6 +3523,7 @@ export class AgentManager {
 
     if (!options?.fromHistory && isTurnTerminalEvent(event)) {
       this.runs.settleTerminalRun(agent.id, eventTurnId);
+      this.transcriptTailer.resyncAfterRun(agent.id);
       if (isForegroundEvent) {
         this.finalizeForegroundTurn(agent, eventTurnId);
       }
@@ -3961,6 +4146,7 @@ export class AgentManager {
    * either install them or close them.
    */
   async flushForShutdown(): Promise<void> {
+    this.transcriptTailer.dispose();
     await this.flushTasks({ includeAgentRegistrations: true });
   }
 

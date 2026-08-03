@@ -625,6 +625,20 @@ export interface AgentSession {
   startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<{ turnId: string }>;
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
+  /**
+   * Absolute path of the provider-owned transcript backing this session, when
+   * one exists on disk that another process may append to (a turn driven by an
+   * external client writes there without the daemon seeing session events).
+   * Null when the provider has no on-disk transcript or its location is
+   * unknown. Enables the manager's transcript tailer to stream externally-run
+   * turns live.
+   */
+  externalTranscriptPath?(): string | null;
+  /**
+   * Convert whole transcript lines appended by an external process into
+   * timeline entries, using the same conversion streamHistory replay applies.
+   */
+  convertExternalTranscriptLines?(content: string): ImportedTimelineEntry[];
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;

@@ -2478,7 +2478,11 @@ export class DaemonClient {
 
   async updateAgent(
     agentId: string,
-    updates: { name?: string; labels?: Record<string, string> },
+    updates: {
+      name?: string;
+      labels?: Record<string, string>;
+      externalTurn?: "running" | "idle";
+    },
   ): Promise<void> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
@@ -2488,6 +2492,7 @@ export class DaemonClient {
       ...(updates.labels && Object.keys(updates.labels).length > 0
         ? { labels: updates.labels }
         : {}),
+      ...(updates.externalTurn !== undefined ? { externalTurn: updates.externalTurn } : {}),
       requestId,
     });
     const payload = await this.sendRequest({

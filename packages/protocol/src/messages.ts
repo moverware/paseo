@@ -818,6 +818,10 @@ export const UpdateAgentRequestMessageSchema = z.object({
   agentId: z.string(),
   name: z.string().optional(),
   labels: z.record(z.string(), z.string()).optional(),
+  // Report from an external process running this agent's turns (e.g. the
+  // provider CLI in a terminal pane): "running" with each prompt/tool use,
+  // "idle" when the turn ends. Projects into the agent's status.
+  externalTurn: z.enum(["running", "idle"]).optional(),
   requestId: z.string(),
 });
 
