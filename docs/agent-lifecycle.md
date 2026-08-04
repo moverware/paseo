@@ -38,6 +38,9 @@ like daemon-run turns; all live in `agent-manager.ts` unless noted:
 - `externalTurnUntil` projects status `running` while an external turn is active. It is fed by tail
   activity (90-second decay) and by explicit reports: `update_agent_request.externalTurn`
   (`paseo agent update --external-turn running|idle`), for the external process's own lifecycle hooks.
+  Once a report has been seen, reports own the status and tail activity stops driving it — the tail
+  flushes a turn's last lines after the idle report, and must not re-mark the turn active. Reported
+  running decays after 5 minutes without a fresh report, covering long single tool calls.
   Projection-only — `lastStatus` on disk keeps the lifecycle, so restarts never resurrect a stale
   `running`.
 - A cancel request with no daemon-side run spawns `daemon.externalInterruptCommand` from config

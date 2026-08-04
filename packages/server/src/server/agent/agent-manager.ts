@@ -79,11 +79,18 @@ import {
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
 /**
- * How long external-turn activity keeps an agent projected as running without
- * a fresh signal. Backstop only: explicit idle reports end the turn crisply,
- * and tail activity refreshes the window while lines keep arriving.
+ * How long external-turn TAIL activity keeps an agent projected as running
+ * without a fresh signal. Backstop for agents whose external process sends no
+ * explicit reports; refreshed while lines keep arriving.
  */
 const EXTERNAL_TURN_DECAY_MS = 90_000;
+/**
+ * Decay for explicitly REPORTED running turns. Longer than the tail decay
+ * because reports are throttled and a long single tool call emits neither
+ * beats nor transcript lines; a dead external process is bounded by this
+ * plus whatever supervision archives it.
+ */
+const EXTERNAL_TURN_REPORT_DECAY_MS = 300_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -368,6 +375,15 @@ interface ManagedAgentBase {
    * activity re-establishes it.
    */
   externalTurnUntil: number | null;
+  /**
+   * True once an explicit externalTurn report has arrived for this agent (this
+   * daemon run). From then on the reports OWN the status and tail activity
+   * stops driving it: the tailer flushes a turn's last lines seconds AFTER the
+   * external process reports idle, and letting that flush re-mark the turn
+   * active kept the client spinner running for the full decay after every
+   * turn (measured 2026-08-03).
+   */
+  externalTurnReportsSeen: boolean;
 }
 
 type ManagedAgentWithSession = ManagedAgentBase & {
@@ -1577,6 +1593,7 @@ export class AgentManager {
         internal: record.internal,
         labels: record.labels,
         externalTurnUntil: null,
+        externalTurnReportsSeen: false,
       },
     });
   }
@@ -1991,7 +2008,12 @@ export class AgentManager {
       recorded = true;
     }
     if (recorded) {
-      this.setExternalTurnUntil(agent, Date.now() + EXTERNAL_TURN_DECAY_MS);
+      // Tail activity implies running only until explicit reports appear —
+      // the trailing flush after a turn lands seconds after the idle report,
+      // and must not re-mark the turn active (externalTurnReportsSeen).
+      if (!agent.externalTurnReportsSeen) {
+        this.setExternalTurnUntil(agent, Date.now() + EXTERNAL_TURN_DECAY_MS);
+      }
       this.touchUpdatedAt(agent);
       this.emitState(agent);
     }
@@ -2008,9 +2030,10 @@ export class AgentManager {
     if (!agent) {
       return;
     }
+    agent.externalTurnReportsSeen = true;
     this.setExternalTurnUntil(
       agent,
-      state === "running" ? Date.now() + EXTERNAL_TURN_DECAY_MS : null,
+      state === "running" ? Date.now() + EXTERNAL_TURN_REPORT_DECAY_MS : null,
     );
     this.emitState(agent, { persist: false });
   }
@@ -3030,6 +3053,7 @@ export class AgentManager {
       internal: config.internal ?? false,
       labels: options?.labels ?? {},
       externalTurnUntil: null,
+      externalTurnReportsSeen: false,
     } as ActiveManagedAgent;
   }
 
@@ -3084,6 +3108,7 @@ export class AgentManager {
       finalizedForegroundTurnIds: new Set(),
       unsubscribeSession: null,
       externalTurnUntil: null,
+      externalTurnReportsSeen: false,
     };
   }
 
