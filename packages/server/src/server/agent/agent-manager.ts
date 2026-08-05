@@ -2106,7 +2106,20 @@ export class AgentManager {
       return false;
     }
     this.logger.info({ agentId }, "external interrupt command launched");
+    // Flip to idle now: an interrupted external turn never runs its normal
+    // turn-end hook, so nothing else reports idle and clients that gate on
+    // status leaving "running" (the app's cancel spinner) would hang for the
+    // full decay. Self-correcting if the interrupt failed to land — the
+    // external process's next beat or tool use re-reports running.
+    this.setExternalTurnUntil(agent, null);
+    this.emitState(agent, { persist: false });
     return true;
+  }
+
+  /** True when this agent's status projects as running from an external turn. */
+  hasActiveExternalTurn(agentId: string): boolean {
+    const agent = this.agents.get(agentId);
+    return agent != null && isExternalTurnActive(agent);
   }
 
   private setExternalTurnUntil(agent: ManagedAgent, until: number | null): void {

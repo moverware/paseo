@@ -7,6 +7,7 @@ import {
   archiveAgentCommand,
   cancelAgentRunCommand,
   detachAgentCommand,
+  ExternalTurnInterruptError,
   setAgentModeCommand,
   updateAgentCommand,
   type LifecycleAgentSnapshot,
@@ -46,6 +47,7 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   readonly settledDuringCancellationAgentIds = new Set<string>();
   readonly rejectedCancellationAgentIds = new Set<string>();
   readonly externalTurnAgentIds = new Set<string>();
+  readonly externalInterruptUnavailableAgentIds = new Set<string>();
   readonly externalInterruptAgentIds: string[] = [];
   readonly externalTurnReports: Array<{ agentId: string; state: "running" | "idle" }> = [];
 
@@ -63,8 +65,15 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     if (!this.externalTurnAgentIds.has(agentId)) {
       return false;
     }
+    if (this.externalInterruptUnavailableAgentIds.has(agentId)) {
+      return false;
+    }
     this.externalInterruptAgentIds.push(agentId);
     return true;
+  }
+
+  hasActiveExternalTurn(agentId: string): boolean {
+    return this.externalTurnAgentIds.has(agentId);
   }
 
   reportExternalTurn(agentId: string, state: "running" | "idle"): void {
@@ -208,6 +217,18 @@ describe("agent lifecycle commands", () => {
     });
     expect(manager.cancelledAgentIds).toEqual([]);
     expect(manager.externalInterruptAgentIds).toEqual(["agent-1"]);
+  });
+
+  test("fails loudly when an external turn cannot be interrupted", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "idle"));
+    manager.externalTurnAgentIds.add("agent-1");
+    manager.externalInterruptUnavailableAgentIds.add("agent-1");
+
+    await expect(
+      cancelAgentRunCommand({ agentManager: manager, logger }, "agent-1"),
+    ).rejects.toThrow(ExternalTurnInterruptError);
   });
 
   test("forwards externalTurn reports through updateAgentCommand", async () => {
