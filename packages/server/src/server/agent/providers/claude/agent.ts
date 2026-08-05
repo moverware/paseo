@@ -91,6 +91,7 @@ import {
   type AgentPermissionUpdate,
   type AgentPersistenceHandle,
   type AgentProviderNotice,
+  type AgentPromptContentBlock,
   type AgentPromptInput,
   type AgentRunOptions,
   type AgentRunResult,
@@ -111,6 +112,7 @@ import {
   type ProviderCatalog,
   type ResolveAgentDefaultModeInput,
 } from "../../agent-sdk-types.js";
+import { resolvePaseoHome } from "../../../paseo-home.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import {
   checkProviderLaunchAvailable,
@@ -717,6 +719,23 @@ function isClaudeTranscriptNoiseText(value: unknown): boolean {
     isClaudeNoResponsePlaceholderText(value) ||
     isClaudeLocalCommandStdout(value)
   );
+}
+
+const HOOK_BLOCK_PREFIX = "UserPromptSubmit operation blocked by hook:\n";
+
+/**
+ * A hook that refuses a turn in order to route it to another process marks
+ * its stderr with a leading "⤳". Returns that stderr line when present, so
+ * the caller can render it bare instead of the CLI's block wrapper.
+ */
+export function extractRoutedHookNote(text: string): string | null {
+  if (!text.startsWith(HOOK_BLOCK_PREFIX)) {
+    return null;
+  }
+  const body = text.slice(HOOK_BLOCK_PREFIX.length);
+  const match = body.match(/^\[[^\]]*\]:\s*(.*)$/m);
+  const note = match?.[1]?.trim() ?? "";
+  return note.startsWith("⤳") ? note : null;
 }
 
 function collectClaudeTextContentParts(content: unknown): string[] {
@@ -2154,6 +2173,7 @@ class ClaudeAgentSession implements AgentSession {
       this.completeAutonomousTurn();
     }
 
+    this.persistPromptImages(prompt);
     const sdkMessage = this.toSdkUserMessage(prompt);
     const sdkUserMessageId =
       typeof sdkMessage.uuid === "string" && sdkMessage.uuid.length > 0 ? sdkMessage.uuid : null;
@@ -3180,6 +3200,45 @@ class ClaudeAgentSession implements AgentSession {
     return result;
   }
 
+  /**
+   * Write the turn's image blocks to disk before the SDK sees them. Prompt
+   * images otherwise exist only as base64 in memory, so a UserPromptSubmit
+   * hook that routes this turn to another process has no way to hand the
+   * images over — the manifest gives it fresh file paths to append to the
+   * routed prompt. Only the newest turn's files are kept; a write failure
+   * must not break the turn.
+   */
+  private persistPromptImages(prompt: AgentPromptInput): void {
+    if (!this.agentId || typeof prompt === "string") {
+      return;
+    }
+    const images = prompt.filter(
+      (block): block is Extract<AgentPromptContentBlock, { type: "image" }> =>
+        typeof block === "object" && block !== null && "type" in block && block.type === "image",
+    );
+    if (images.length === 0) {
+      return;
+    }
+    try {
+      const dir = path.join(resolvePaseoHome(), "prompt-images", this.agentId);
+      fs.mkdirSync(dir, { recursive: true });
+      for (const name of fs.readdirSync(dir)) {
+        fs.rmSync(path.join(dir, name), { force: true });
+      }
+      const now = Date.now();
+      const files: string[] = [];
+      images.forEach((image, index) => {
+        const ext = image.mimeType.split("/")[1]?.split("+")[0] || "png";
+        const file = path.join(dir, `${now}-${index}.${ext}`);
+        fs.writeFileSync(file, Buffer.from(image.data, "base64"));
+        files.push(file);
+      });
+      fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ ts: now, paths: files }));
+    } catch (error) {
+      this.logger.warn({ err: error }, "Failed to persist prompt images");
+    }
+  }
+
   private toSdkUserMessage(prompt: AgentPromptInput): SDKUserMessage {
     const content: Array<
       | { type: "text"; text: string }
@@ -4102,12 +4161,17 @@ class ClaudeAgentSession implements AgentSession {
       const resultText = typeof message.result === "string" ? message.result.trim() : "";
       const outputTokens = message.usage?.output_tokens;
       if (resultText.length > 0 && outputTokens === 0 && !this.activeTurnHasAssistantText) {
+        // A UserPromptSubmit hook that refuses a turn to hand it to another
+        // process marks its stderr with "⤳"; render just that line instead of
+        // the CLI's "operation blocked by hook: [path]" wrapper plus the
+        // echoed original prompt. Other hook blocks keep the full text.
+        const routedNote = extractRoutedHookNote(resultText);
         events.push({
           type: "timeline",
           provider: "claude",
           item: {
             type: "assistant_message",
-            text: resultText,
+            text: routedNote ?? resultText,
             messageId: message.uuid,
           },
         });
