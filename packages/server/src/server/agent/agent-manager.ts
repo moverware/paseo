@@ -2024,27 +2024,27 @@ export class AgentManager {
 
   /**
    * True when a tailed user message is the external process's copy of a
-   * prompt this daemon already committed and then routed away: the timeline
-   * tail reads [user X, assistant "⤳ …"] and the tailed text matches X
-   * (modulo appendix lines the router adds, e.g. attached-image paths).
-   * Without this the phone thread shows every routed message twice.
+   * prompt this daemon already committed and then routed away. After a
+   * routed turn the timeline ends with that user row (optionally followed by
+   * a "⤳ …" note), and the tail's first item replays the same text — modulo
+   * appendix lines the router adds, e.g. attached-image paths. Without this
+   * the client shows every routed message twice. Messages typed directly in
+   * the external process never have a committed user row here (they arrive
+   * via the tail alone), so they can't match.
    */
   private isRoutedPromptEcho(agentId: string, text: string): boolean {
     const rows = this.timelineStore.getRows(agentId);
-    for (let i = rows.length - 1; i >= 0 && i >= rows.length - 6; i--) {
+    for (let i = rows.length - 1; i >= 0 && i >= rows.length - 2; i--) {
       const item = rows[i].item;
-      if (item.type !== "assistant_message" || !item.text.startsWith("⤳")) {
+      if (item.type === "assistant_message" && item.text.startsWith("⤳")) {
         continue;
       }
-      for (let j = i - 1; j >= 0 && j >= i - 3; j--) {
-        const prior = rows[j].item;
-        if (prior.type === "user_message") {
-          const normalized = text.trim();
-          const routed = prior.text.trim();
-          return normalized === routed || normalized.startsWith(`${routed}\n`);
-        }
+      if (item.type !== "user_message") {
+        return false;
       }
-      return false;
+      const normalized = text.trim();
+      const routed = item.text.trim();
+      return normalized === routed || normalized.startsWith(`${routed}\n`);
     }
     return false;
   }

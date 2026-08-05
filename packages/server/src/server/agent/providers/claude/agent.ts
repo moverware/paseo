@@ -4162,19 +4162,23 @@ class ClaudeAgentSession implements AgentSession {
       const outputTokens = message.usage?.output_tokens;
       if (resultText.length > 0 && outputTokens === 0 && !this.activeTurnHasAssistantText) {
         // A UserPromptSubmit hook that refuses a turn to hand it to another
-        // process marks its stderr with "⤳"; render just that line instead of
-        // the CLI's "operation blocked by hook: [path]" wrapper plus the
-        // echoed original prompt. Other hook blocks keep the full text.
+        // process marks its stderr with "⤳". A bare marker renders nothing —
+        // the routed reply streaming in is the user-visible outcome; marker
+        // plus text renders as that one line (e.g. "⤳ interrupted the
+        // running turn"). Other hook blocks keep the CLI's full text.
         const routedNote = extractRoutedHookNote(resultText);
-        events.push({
-          type: "timeline",
-          provider: "claude",
-          item: {
-            type: "assistant_message",
-            text: routedNote ?? resultText,
-            messageId: message.uuid,
-          },
-        });
+        const routedSilently = routedNote !== null && routedNote.replace("⤳", "").trim() === "";
+        if (!routedSilently) {
+          events.push({
+            type: "timeline",
+            provider: "claude",
+            item: {
+              type: "assistant_message",
+              text: routedNote ?? resultText,
+              messageId: message.uuid,
+            },
+          });
+        }
       }
       events.push({ type: "turn_completed", provider: "claude", usage });
       return;

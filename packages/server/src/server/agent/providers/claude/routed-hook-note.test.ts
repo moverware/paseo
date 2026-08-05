@@ -13,6 +13,10 @@ describe("extractRoutedHookNote", () => {
     );
   });
 
+  test("returns the bare marker for a silent routing", () => {
+    expect(extractRoutedHookNote(wrap("⤳", "5 - hardware"))).toBe("⤳");
+  });
+
   test("leaves unmarked hook blocks alone", () => {
     expect(extractRoutedHookNote(wrap("Session continued in another client"))).toBeNull();
   });
