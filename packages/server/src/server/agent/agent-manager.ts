@@ -1991,6 +1991,9 @@ export class AgentManager {
       if (entry.item.type === "user_message" && isSystemInjectedEnvelope(entry.item.text)) {
         continue;
       }
+      if (entry.item.type === "user_message" && this.isRoutedPromptEcho(agentId, entry.item.text)) {
+        continue;
+      }
       const row = this.recordTimeline(
         agentId,
         entry.item,
@@ -2017,6 +2020,33 @@ export class AgentManager {
       this.touchUpdatedAt(agent);
       this.emitState(agent);
     }
+  }
+
+  /**
+   * True when a tailed user message is the external process's copy of a
+   * prompt this daemon already committed and then routed away: the timeline
+   * tail reads [user X, assistant "⤳ …"] and the tailed text matches X
+   * (modulo appendix lines the router adds, e.g. attached-image paths).
+   * Without this the phone thread shows every routed message twice.
+   */
+  private isRoutedPromptEcho(agentId: string, text: string): boolean {
+    const rows = this.timelineStore.getRows(agentId);
+    for (let i = rows.length - 1; i >= 0 && i >= rows.length - 6; i--) {
+      const item = rows[i].item;
+      if (item.type !== "assistant_message" || !item.text.startsWith("⤳")) {
+        continue;
+      }
+      for (let j = i - 1; j >= 0 && j >= i - 3; j--) {
+        const prior = rows[j].item;
+        if (prior.type === "user_message") {
+          const normalized = text.trim();
+          const routed = prior.text.trim();
+          return normalized === routed || normalized.startsWith(`${routed}\n`);
+        }
+      }
+      return false;
+    }
+    return false;
   }
 
   /**
