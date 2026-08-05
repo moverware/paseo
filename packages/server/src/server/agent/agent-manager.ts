@@ -479,6 +479,20 @@ interface SubscriptionRecord {
 
 const BUSY_STATUSES: Set<AgentLifecycleStatus> = new Set(["initializing", "running"]);
 
+/**
+ * Strip the decorations a routed prompt picks up on its way through the
+ * external process before echo comparison: inline "[Image #N]" markers (the
+ * external CLI renders attached image paths as markers, positioned wherever
+ * the blocks land) and the router's trailing "Attached images (read these
+ * files): …" appendix. The remaining text is what the user actually typed.
+ */
+function normalizeRoutedPromptText(text: string): string {
+  const withoutMarkers = text.replace(/\[Image #\d+\]/g, "");
+  const appendixIndex = withoutMarkers.indexOf("Attached images (read these files):");
+  const body = appendixIndex === -1 ? withoutMarkers : withoutMarkers.slice(0, appendixIndex);
+  return body.trim();
+}
+
 /** True while a turn run by an external process counts as active for this
  * agent (see ManagedAgentBase.externalTurnUntil). */
 export function isExternalTurnActive(agent: { externalTurnUntil: number | null }): boolean {
@@ -2042,8 +2056,8 @@ export class AgentManager {
       if (item.type !== "user_message") {
         return false;
       }
-      const normalized = text.trim();
-      const routed = item.text.trim();
+      const normalized = normalizeRoutedPromptText(text);
+      const routed = normalizeRoutedPromptText(item.text);
       return normalized === routed || normalized.startsWith(`${routed}\n`);
     }
     return false;
