@@ -2032,6 +2032,10 @@ export class AgentManager {
         this.setExternalTurnUntil(agent, Date.now() + EXTERNAL_TURN_DECAY_MS);
       }
       this.touchUpdatedAt(agent);
+      // Cheap for claude (cached fields, no SDK spawn) and how a /model
+      // switch made in the external process reaches the client's selector
+      // mid-turn instead of at the next reload.
+      void this.refreshRuntimeInfo(agent);
       this.emitState(agent);
     }
   }

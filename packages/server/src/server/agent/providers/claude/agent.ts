@@ -2285,8 +2285,49 @@ class ClaudeAgentSession implements AgentSession {
     const timeline: PersistedTimelineEntry[] = [];
     for (const line of content.split(/\r?\n/)) {
       this.ingestPersistedHistoryLine(line, timeline);
+      this.captureExternalRuntimeModel(line);
     }
     return timeline;
+  }
+
+  /**
+   * Track the model the EXTERNAL process is actually using, from the models
+   * stamped on its assistant transcript entries. A /model switch in the
+   * external CLI never touches this daemon-side session, so without this the
+   * client's model selector stays stale until the next full reload.
+   */
+  private captureExternalRuntimeModel(line: string): void {
+    if (!line.includes('"model"') && !line.includes("<command-name>/model")) {
+      return;
+    }
+    let model: string | null = null;
+    try {
+      const entry = JSON.parse(line) as {
+        type?: string;
+        message?: { model?: unknown; content?: unknown };
+      };
+      if (entry?.type === "assistant" && typeof entry.message?.model === "string") {
+        model = entry.message.model;
+      } else if (entry?.type === "user" && typeof entry.message?.content === "string") {
+        // A /model run is recorded as <command-name>/model … <command-args>id —
+        // parsing it here is what makes an external switch reach the client's
+        // selector at switch time rather than at the next assistant message.
+        const content = entry.message.content;
+        if (content.includes("<command-name>/model</command-name>")) {
+          const args = content.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1]?.trim();
+          model = args || null;
+        }
+      }
+    } catch {
+      return;
+    }
+    if (!model || model === this.lastRuntimeModel) {
+      return;
+    }
+    const normalized = normalizeClaudeRuntimeModelId(model);
+    this.lastOptionsModel = normalized ?? model;
+    this.lastRuntimeModel = model;
+    this.cachedRuntimeInfo = null;
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {
