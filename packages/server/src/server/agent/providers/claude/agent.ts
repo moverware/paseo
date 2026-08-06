@@ -4599,6 +4599,10 @@ class ClaudeAgentSession implements AgentSession {
     const timeline: PersistedTimelineEntry[] = [];
     for (const line of content.split(/\r?\n/)) {
       this.ingestPersistedHistoryLine(line, timeline);
+      // History replay must land on the transcript's true model too: a
+      // reload swaps in a fresh session whose model knowledge otherwise
+      // resets to stored config until the next live tail line arrives.
+      this.captureExternalRuntimeModel(line);
     }
 
     if (timeline.length > 0) {
