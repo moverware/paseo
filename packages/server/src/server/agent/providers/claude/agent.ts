@@ -2321,6 +2321,24 @@ class ClaudeAgentSession implements AgentSession {
     this.lastOptionsModel = normalized ?? modelId;
     this.lastRuntimeModel = modelId;
     this.cachedRuntimeInfo = null;
+    this.adoptConfigModelFromExternal();
+  }
+
+  /**
+   * Keep this session's launch config on the externally-observed model. The
+   * config seeds the SDK child this daemon-side session spawns for routed
+   * turns — left stale, every routed message boots a child on the OLD model
+   * whose init stamps runtime info, flashing the client selector wrong for
+   * the length of the turn (measured 2026-08-06).
+   */
+  private adoptConfigModelFromExternal(): void {
+    if (!this.lastOptionsModel || this.config.model === this.lastOptionsModel) {
+      return;
+    }
+    this.config.model = this.lastOptionsModel;
+    this.contextUsage.setInitialContextWindowMaxTokens(
+      findClaudeModel(this.config.model)?.contextWindowMaxTokens,
+    );
   }
 
   /**
@@ -2352,6 +2370,7 @@ class ClaudeAgentSession implements AgentSession {
     this.lastOptionsModel = normalized ?? model;
     this.lastRuntimeModel = model;
     this.cachedRuntimeInfo = null;
+    this.adoptConfigModelFromExternal();
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {
