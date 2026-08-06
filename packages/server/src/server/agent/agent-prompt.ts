@@ -197,6 +197,18 @@ export async function sendPromptToAgent(
     await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
   }
 
+  const slashPrompt = typeof params.prompt === "string" ? params.prompt.trim() : null;
+  if (
+    slashPrompt?.startsWith("/") &&
+    (await params.agentManager.deliverSlashCommandExternally(
+      params.agentId,
+      slashPrompt,
+      params.messageId,
+    ))
+  ) {
+    return { outOfBand: true };
+  }
+
   const runOptions = params.messageId
     ? { ...params.runOptions, clientMessageId: params.messageId }
     : params.runOptions;

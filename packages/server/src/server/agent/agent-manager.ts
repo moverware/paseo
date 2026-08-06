@@ -276,6 +276,12 @@ export interface AgentManagerOptions {
    * PASEO_AGENT_CWD and PASEO_AGENT_LABELS (JSON) in its environment.
    */
   externalInterruptCommand?: string[];
+  /**
+   * Command to deliver a slash-command prompt to a turn's external process
+   * (argv array; prompt in PASEO_PROMPT, plus the PASEO_AGENT_* env of
+   * externalInterruptCommand). See deliverSlashCommandExternally.
+   */
+  externalPromptCommand?: string[];
   logger: Logger;
 }
 
@@ -493,6 +499,10 @@ function normalizeRoutedPromptText(text: string): string {
   return body.trim();
 }
 
+function normalizeExternalCommand(argv: string[] | undefined): string[] | null {
+  return argv && argv.length > 0 ? argv : null;
+}
+
 /** True while a turn run by an external process counts as active for this
  * agent (see ManagedAgentBase.externalTurnUntil). */
 export function isExternalTurnActive(agent: { externalTurnUntil: number | null }): boolean {
@@ -646,6 +656,7 @@ export class AgentManager {
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly transcriptTailer: TranscriptTailer;
   private readonly externalInterruptCommand: string[] | null;
+  private readonly externalPromptCommand: string[] | null;
   private readonly externalTurnExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private acceptingAgentRegistrations = true;
 
@@ -674,7 +685,8 @@ export class AgentManager {
         this.notifyForegroundTurnWaiters(agentId, event);
       },
     });
-    this.externalInterruptCommand = options.externalInterruptCommand ?? null;
+    this.externalInterruptCommand = normalizeExternalCommand(options.externalInterruptCommand);
+    this.externalPromptCommand = normalizeExternalCommand(options.externalPromptCommand);
     this.transcriptTailer = new TranscriptTailer({
       logger: this.logger,
       hasInFlightRun: (agentId) => this.hasInFlightRun(agentId),
@@ -2138,6 +2150,65 @@ export class AgentManager {
   hasActiveExternalTurn(agentId: string): boolean {
     const agent = this.agents.get(agentId);
     return agent != null && isExternalTurnActive(agent);
+  }
+
+  /**
+   * Hand a slash-command prompt to the external process driving this agent,
+   * via daemon.externalPromptCommand (argv; prompt in PASEO_PROMPT). Built-in
+   * commands like /model execute locally in the daemon-side SDK child without
+   * firing prompt hooks, so hook-based routing cannot intercept them and they
+   * mutate a shadow session nobody is using. Commits the user's message row
+   * first (so clients reconcile their optimistic bubble and the external
+   * echo dedupes), then spawns. Returns false when the agent is not
+   * externally driven or no command is configured.
+   */
+  async deliverSlashCommandExternally(
+    agentId: string,
+    promptText: string,
+    clientMessageId?: string,
+  ): Promise<boolean> {
+    const agent = this.agents.get(agentId);
+    if (!agent || !this.externalPromptCommand || this.externalPromptCommand.length === 0) {
+      return false;
+    }
+    // Externally driven = external-turn reports have arrived this daemon run,
+    // or the deployment stamped the agent as externally homed at import.
+    if (!agent.externalTurnReportsSeen && agent.labels.origin !== "herdr") {
+      return false;
+    }
+    await this.appendTimelineItem(agentId, {
+      type: "user_message",
+      text: promptText,
+      ...(clientMessageId ? { clientMessageId } : {}),
+    });
+    const [command, ...args] = this.externalPromptCommand;
+    try {
+      const child = spawn(command, args, {
+        env: {
+          ...process.env,
+          PASEO_AGENT_ID: agent.id,
+          PASEO_AGENT_SESSION_ID: agent.persistence?.sessionId ?? "",
+          PASEO_AGENT_CWD: agent.cwd,
+          PASEO_AGENT_LABELS: JSON.stringify(agent.labels),
+          PASEO_PROMPT: promptText,
+        },
+        stdio: "ignore",
+        detached: false,
+      });
+      child.on("error", (error) => {
+        this.logger.warn({ err: error, agentId }, "external prompt command failed to spawn");
+      });
+      child.on("exit", (code) => {
+        if (code !== 0) {
+          this.logger.warn({ agentId, code }, "external prompt command exited non-zero");
+        }
+      });
+    } catch (error) {
+      this.logger.warn({ err: error, agentId }, "external prompt command failed");
+      return false;
+    }
+    this.logger.info({ agentId }, "slash command delegated to external process");
+    return true;
   }
 
   private setExternalTurnUntil(agent: ManagedAgent, until: number | null): void {

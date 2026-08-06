@@ -254,6 +254,9 @@ export const PersistedConfigSchema = z
         // Argv array run to interrupt an agent turn executing in an external
         // process (terminal pane CLI). See AgentManagerOptions.externalInterruptCommand.
         externalInterruptCommand: z.array(z.string()).optional(),
+        // Argv array run to deliver a slash-command prompt to an external
+        // process (prompt in PASEO_PROMPT). See AgentManagerOptions.externalPromptCommand.
+        externalPromptCommand: z.array(z.string()).optional(),
         terminalProfiles: z.array(TerminalProfileSchema).optional(),
         cors: z
           .object({

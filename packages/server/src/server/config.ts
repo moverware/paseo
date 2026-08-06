@@ -508,6 +508,7 @@ export function loadConfig(
     enableTerminalAgentHooks: persisted.daemon?.enableTerminalAgentHooks ?? false,
     appendSystemPrompt,
     externalInterruptCommand: persisted.daemon?.externalInterruptCommand,
+    externalPromptCommand: persisted.daemon?.externalPromptCommand,
     terminalProfiles,
     mcpDebug: env.MCP_DEBUG === "1",
     isDev: resolvePaseoNodeEnv(env) === "development",
