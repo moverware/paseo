@@ -403,6 +403,16 @@ export type AgentStreamEvent =
     }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
   | {
+      /**
+       * This turn's prompt was refused and handed to the external process;
+       * its transcript will echo the prompt back through the tail. The
+       * manager records it so the echo is consumed instead of re-rendered.
+       */
+      type: "external_echo_expected";
+      provider: AgentProvider;
+      text: string;
+    }
+  | {
       type: "timeline";
       item: AgentTimelineItem;
       provider: AgentProvider;

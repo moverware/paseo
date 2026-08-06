@@ -91,6 +91,10 @@ const EXTERNAL_TURN_DECAY_MS = 90_000;
  * plus whatever supervision archives it.
  */
 const EXTERNAL_TURN_REPORT_DECAY_MS = 300_000;
+/** How long a delivered prompt may wait for its transcript echo — slash
+ * commands flush only with the external process's next turn, which can be
+ * arbitrarily later; expired entries just mean one rendered duplicate. */
+const PENDING_ECHO_TTL_MS = 600_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -658,6 +662,13 @@ export class AgentManager {
   private readonly externalInterruptCommand: string[] | null;
   private readonly externalPromptCommand: string[] | null;
   private readonly externalTurnExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Prompts handed to an external process whose transcript echo has not been
+   * consumed yet, keyed by agent id (manager-level so reloads don't lose
+   * them). Exact one-shot accounting replaces content-window heuristics: each
+   * delivery eats exactly one matching tailed user message.
+   */
+  private readonly pendingExternalEchoes = new Map<string, Array<{ text: string; ts: number }>>();
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -2037,7 +2048,10 @@ export class AgentManager {
       if (entry.item.type === "user_message" && isSystemInjectedEnvelope(entry.item.text)) {
         continue;
       }
-      if (entry.item.type === "user_message" && this.isRoutedPromptEcho(agentId, entry.item.text)) {
+      if (
+        entry.item.type === "user_message" &&
+        this.consumePendingExternalEcho(agentId, entry.item.text)
+      ) {
         continue;
       }
       const row = this.recordTimeline(
@@ -2083,23 +2097,34 @@ export class AgentManager {
    * the external process never have a committed user row here (they arrive
    * via the tail alone), so they can't match.
    */
-  private isRoutedPromptEcho(agentId: string, text: string): boolean {
-    const rows = this.timelineStore.getRows(agentId);
+  private recordPendingExternalEcho(agentId: string, text: string): void {
     const normalized = normalizeRoutedPromptText(text);
-    // The echo is the first user message the tail emits after the routed
-    // commit, but other transcript rows can land in between — slash commands
-    // flush only with the NEXT turn, and the external process's own task
-    // notifications interleave (measured 2026-08-06). Scan back a bounded
-    // window and judge against the first committed user row found.
-    for (let i = rows.length - 1; i >= 0 && i >= rows.length - 12; i--) {
-      const item = rows[i].item;
-      if (item.type !== "user_message") {
-        continue;
-      }
-      const routed = normalizeRoutedPromptText(item.text);
-      return normalized === routed || normalized.startsWith(`${routed}\n`);
+    if (!normalized) {
+      return;
     }
-    return false;
+    const entries = this.pendingExternalEchoes.get(agentId) ?? [];
+    entries.push({ text: normalized, ts: Date.now() });
+    this.pendingExternalEchoes.set(agentId, entries);
+  }
+
+  /** True when a tailed user message is the echo of a delivered prompt;
+   * consumes the ledger entry so one delivery eats exactly one echo. */
+  private consumePendingExternalEcho(agentId: string, text: string): boolean {
+    const entries = this.pendingExternalEchoes.get(agentId);
+    if (!entries || entries.length === 0) {
+      return false;
+    }
+    const cutoff = Date.now() - PENDING_ECHO_TTL_MS;
+    const live = entries.filter((entry) => entry.ts >= cutoff);
+    const normalized = normalizeRoutedPromptText(text);
+    const index = live.findIndex(
+      (entry) => normalized === entry.text || normalized.startsWith(`${entry.text}\n`),
+    );
+    if (index >= 0) {
+      live.splice(index, 1);
+    }
+    this.pendingExternalEchoes.set(agentId, live);
+    return index >= 0;
   }
 
   /**
@@ -2204,6 +2229,7 @@ export class AgentManager {
       text: promptText,
       ...(clientMessageId ? { clientMessageId } : {}),
     });
+    this.recordPendingExternalEcho(agentId, promptText);
     const [command, ...args] = this.externalPromptCommand;
     try {
       const child = spawn(command, args, {
@@ -3845,6 +3871,10 @@ export class AgentManager {
         return undefined;
       case "turn_started":
         this.onStreamTurnStarted({ agent, eventTurnId, isForegroundEvent });
+        return undefined;
+      case "external_echo_expected":
+        flags.shouldDispatchEvent = false;
+        this.recordPendingExternalEcho(agent.id, event.text);
         return undefined;
       case "permission_requested":
         this.onStreamPermissionRequested(agent, event);
