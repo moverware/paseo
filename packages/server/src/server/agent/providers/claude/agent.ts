@@ -752,10 +752,19 @@ export function extractRoutedHookNote(text: string): string | null {
   if (!text.startsWith(HOOK_BLOCK_PREFIX)) {
     return null;
   }
+  // Several hooks can block the same prompt and the CLI concatenates their
+  // lines — the freshness guard fires alongside the router on routed turns
+  // (it sees the live pane's newer write). The ⤳ marker anywhere in the
+  // block means the turn was routed, and the other hooks' warnings are
+  // noise for a turn that is already refused.
   const body = text.slice(HOOK_BLOCK_PREFIX.length);
-  const match = body.match(/^\[[^\]]*\]:\s*(.*)$/m);
-  const note = match?.[1]?.trim() ?? "";
-  return note.startsWith("⤳") ? note : null;
+  for (const match of body.matchAll(/^\[[^\]]*\]:\s*(.*)$/gm)) {
+    const note = match[1]?.trim() ?? "";
+    if (note.startsWith("⤳")) {
+      return note;
+    }
+  }
+  return null;
 }
 
 function collectClaudeTextContentParts(content: unknown): string[] {

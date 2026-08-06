@@ -25,3 +25,21 @@ describe("extractRoutedHookNote", () => {
     expect(extractRoutedHookNote("Unknown command: /voice")).toBeNull();
   });
 });
+
+describe("extractRoutedHookNote with multiple blocking hooks", () => {
+  test("finds the marker when another hook's block precedes it", () => {
+    const text =
+      "UserPromptSubmit operation blocked by hook:\n" +
+      "[/hooks/session-watermark.py check]: Session continued in another client (last write there at 02:29).\n" +
+      "This window's context is stale; submitting would fork the conversation.\n" +
+      "[/hooks/route-phone-message.py]: ⤳\n\n\nOriginal prompt: hi";
+    expect(extractRoutedHookNote(text)).toBe("⤳");
+  });
+
+  test("still null when no marker in any hook line", () => {
+    const text =
+      "UserPromptSubmit operation blocked by hook:\n" +
+      "[/hooks/session-watermark.py check]: Session continued in another client.";
+    expect(extractRoutedHookNote(text)).toBeNull();
+  });
+});
