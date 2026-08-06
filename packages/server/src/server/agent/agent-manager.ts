@@ -1645,6 +1645,18 @@ export class AgentManager {
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
 
+    // An externally-driven agent's REAL model lives in the external process —
+    // setting it on the daemon-side session mutates a shadow nobody runs
+    // turns on, and the client selector then snaps back to the tailed truth.
+    // Deliver /model to the external process instead; its transcript echoes
+    // the switch, the tail captures it, and the selector converges on fact.
+    if (
+      normalizedModelId &&
+      (await this.deliverSlashCommandExternally(agentId, `/model ${normalizedModelId}`))
+    ) {
+      return;
+    }
+
     if (agent.session.setModel) {
       await agent.session.setModel(normalizedModelId);
     }
