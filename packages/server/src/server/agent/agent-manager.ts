@@ -2056,12 +2056,13 @@ export class AgentManager {
         this.setExternalTurnUntil(agent, Date.now() + EXTERNAL_TURN_DECAY_MS);
       }
       this.touchUpdatedAt(agent);
-      // Cheap for claude (cached fields, no SDK spawn) and how a /model
-      // switch made in the external process reaches the client's selector
-      // mid-turn instead of at the next reload.
-      void this.refreshRuntimeInfo(agent);
       this.emitState(agent);
     }
+    // Outside the recorded gate on purpose: a delegated /model echo dedupes
+    // to zero recorded entries, but the conversion still captured the model —
+    // the refresh is what carries it to the client's selector. Cheap for
+    // claude (cached fields, no SDK spawn); emits state only on change.
+    void this.refreshRuntimeInfo(agent);
   }
 
   /**
