@@ -721,6 +721,26 @@ function isClaudeTranscriptNoiseText(value: unknown): boolean {
   );
 }
 
+/** Model evidence in one raw transcript entry: the model stamped on an
+ * assistant frame, or the <command-args> of a recorded /model run (which is
+ * how an external switch reaches the client's selector without waiting for
+ * the next assistant message). */
+function readTranscriptModelEvidence(entry: unknown): string | null {
+  const record = entry as { type?: string; message?: { model?: unknown; content?: unknown } };
+  if (record?.type === "assistant" && typeof record.message?.model === "string") {
+    return record.message.model;
+  }
+  if (record?.type !== "user" || typeof record.message?.content !== "string") {
+    return null;
+  }
+  const content = record.message.content;
+  if (!content.includes("<command-name>/model</command-name>")) {
+    return null;
+  }
+  const args = content.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1]?.trim();
+  return args || null;
+}
+
 const HOOK_BLOCK_PREFIX = "UserPromptSubmit operation blocked by hook:\n";
 
 /**
@@ -2291,6 +2311,19 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
+   * Adopt a model switch delivered to the external process before the
+   * transcript can prove it: Claude Code records a /model run only with the
+   * NEXT turn, so there is no switch-time truth to tail. Tail capture
+   * corrects this if the delivered switch never executed.
+   */
+  noteExternalModelSwitch(modelId: string): void {
+    const normalized = normalizeClaudeRuntimeModelId(modelId);
+    this.lastOptionsModel = normalized ?? modelId;
+    this.lastRuntimeModel = modelId;
+    this.cachedRuntimeInfo = null;
+  }
+
+  /**
    * Track the model the EXTERNAL process is actually using, from the models
    * stamped on its assistant transcript entries. A /model switch in the
    * external CLI never touches this daemon-side session, so without this the
@@ -2302,26 +2335,17 @@ class ClaudeAgentSession implements AgentSession {
     }
     let model: string | null = null;
     try {
-      const entry = JSON.parse(line) as {
-        type?: string;
-        message?: { model?: unknown; content?: unknown };
-      };
-      if (entry?.type === "assistant" && typeof entry.message?.model === "string") {
-        model = entry.message.model;
-      } else if (entry?.type === "user" && typeof entry.message?.content === "string") {
-        // A /model run is recorded as <command-name>/model … <command-args>id —
-        // parsing it here is what makes an external switch reach the client's
-        // selector at switch time rather than at the next assistant message.
-        const content = entry.message.content;
-        if (content.includes("<command-name>/model</command-name>")) {
-          const args = content.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1]?.trim();
-          model = args || null;
-        }
-      }
+      model = readTranscriptModelEvidence(JSON.parse(line));
     } catch {
       return;
     }
     if (!model || model === this.lastRuntimeModel) {
+      return;
+    }
+    // Assistant stamps drop the [1m] suffix; do not downgrade a known
+    // long-context variant to its bare spelling of the same model.
+    if (this.lastOptionsModel?.startsWith(`${model}[`)) {
+      this.lastRuntimeModel = model;
       return;
     }
     const normalized = normalizeClaudeRuntimeModelId(model);

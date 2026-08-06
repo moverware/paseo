@@ -639,6 +639,11 @@ export interface AgentSession {
    * timeline entries, using the same conversion streamHistory replay applies.
    */
   convertExternalTranscriptLines?(content: string): ImportedTimelineEntry[];
+  /**
+   * Adopt a model switch that was delivered to the external process, ahead
+   * of transcript evidence (which lands only with the next turn).
+   */
+  noteExternalModelSwitch?(modelId: string): void;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;

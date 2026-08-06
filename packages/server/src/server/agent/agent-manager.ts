@@ -1654,6 +1654,14 @@ export class AgentManager {
       normalizedModelId &&
       (await this.deliverSlashCommandExternally(agentId, `/model ${normalizedModelId}`))
     ) {
+      // Optimistic: the transcript records a /model run only with the NEXT
+      // turn, so there is no switch-time truth to tail. Tail capture corrects
+      // the session state if the delivered switch never executed.
+      agent.session.noteExternalModelSwitch?.(normalizedModelId);
+      agent.config.model = normalizedModelId;
+      await this.refreshRuntimeInfo(agent);
+      this.touchUpdatedAt(agent);
+      this.emitState(agent);
       return;
     }
 
@@ -2077,17 +2085,23 @@ export class AgentManager {
    */
   private isRoutedPromptEcho(agentId: string, text: string): boolean {
     const rows = this.timelineStore.getRows(agentId);
-    for (let i = rows.length - 1; i >= 0 && i >= rows.length - 2; i--) {
+    const normalized = normalizeRoutedPromptText(text);
+    // Slash commands flush to the external transcript only with the NEXT
+    // turn, so their echo arrives rows after the committed copy — scan a
+    // deeper window for those. Plain prompts echo immediately; two rows.
+    const lookback = normalized.startsWith("/") ? 12 : 2;
+    for (let i = rows.length - 1; i >= 0 && i >= rows.length - lookback; i--) {
       const item = rows[i].item;
-      if (item.type === "assistant_message" && item.text.startsWith("⤳")) {
+      if (item.type !== "user_message") {
         continue;
       }
-      if (item.type !== "user_message") {
+      const routed = normalizeRoutedPromptText(item.text);
+      if (normalized === routed || normalized.startsWith(`${routed}\n`)) {
+        return true;
+      }
+      if (lookback === 2) {
         return false;
       }
-      const normalized = normalizeRoutedPromptText(text);
-      const routed = normalizeRoutedPromptText(item.text);
-      return normalized === routed || normalized.startsWith(`${routed}\n`);
     }
     return false;
   }
