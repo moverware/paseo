@@ -2097,6 +2097,25 @@ export class AgentManager {
    * the external process never have a committed user row here (they arrive
    * via the tail alone), so they can't match.
    */
+  /**
+   * Record a prompt's expected transcript echo BEFORE its run starts. The
+   * route hook delivers to the external process before refusing the daemon
+   * turn, so the echo can reach the tail ahead of any result-time signal
+   * (measured 2026-08-06) — send time is the only unbeatable point. Prompts
+   * that end up running daemon-side never echo (the tailer skips in-flight
+   * runs) and their entries age out by TTL.
+   */
+  recordPendingEchoForExternalAgent(agentId: string, text: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      return;
+    }
+    if (!agent.externalTurnReportsSeen && agent.labels.origin !== "herdr") {
+      return;
+    }
+    this.recordPendingExternalEcho(agentId, text);
+  }
+
   private recordPendingExternalEcho(agentId: string, text: string): void {
     const normalized = normalizeRoutedPromptText(text);
     if (!normalized) {
@@ -3871,10 +3890,6 @@ export class AgentManager {
         return undefined;
       case "turn_started":
         this.onStreamTurnStarted({ agent, eventTurnId, isForegroundEvent });
-        return undefined;
-      case "external_echo_expected":
-        flags.shouldDispatchEvent = false;
-        this.recordPendingExternalEcho(agent.id, event.text);
         return undefined;
       case "permission_requested":
         this.onStreamPermissionRequested(agent, event);

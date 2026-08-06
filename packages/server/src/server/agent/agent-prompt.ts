@@ -213,6 +213,22 @@ export async function sendPromptToAgent(
     ? { ...params.runOptions, clientMessageId: params.messageId }
     : params.runOptions;
 
+  const echoText =
+    typeof params.prompt === "string"
+      ? params.prompt
+      : params.prompt
+          .filter(
+            (block): block is { type: "text"; text: string } =>
+              typeof block === "object" &&
+              block !== null &&
+              "type" in block &&
+              block.type === "text" &&
+              "text" in block,
+          )
+          .map((block) => block.text)
+          .join("\n");
+  params.agentManager.recordPendingEchoForExternalAgent(params.agentId, echoText);
+
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: true,
     runOptions,

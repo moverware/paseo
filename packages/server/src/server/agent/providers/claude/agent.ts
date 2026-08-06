@@ -2057,7 +2057,6 @@ class ClaudeAgentSession implements AgentSession {
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
-  private activeTurnPromptText: string | null = null;
   private compacting = false;
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
@@ -2195,19 +2194,6 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     this.persistPromptImages(prompt);
-    this.activeTurnPromptText =
-      typeof prompt === "string"
-        ? prompt
-        : prompt
-            .filter(
-              (block): block is Extract<AgentPromptContentBlock, { type: "text" }> =>
-                typeof block === "object" &&
-                block !== null &&
-                "type" in block &&
-                block.type === "text",
-            )
-            .map((block) => block.text)
-            .join("\n");
     const sdkMessage = this.toSdkUserMessage(prompt);
     const sdkUserMessageId =
       typeof sdkMessage.uuid === "string" && sdkMessage.uuid.length > 0 ? sdkMessage.uuid : null;
@@ -4265,13 +4251,6 @@ class ClaudeAgentSession implements AgentSession {
         // plus text renders as that one line (e.g. "⤳ interrupted the
         // running turn"). Other hook blocks keep the CLI's full text.
         const routedNote = extractRoutedHookNote(resultText);
-        if (routedNote !== null && this.activeTurnPromptText) {
-          events.push({
-            type: "external_echo_expected",
-            provider: "claude",
-            text: this.activeTurnPromptText,
-          });
-        }
         const routedSilently = routedNote !== null && routedNote.replace("⤳", "").trim() === "";
         if (!routedSilently) {
           events.push({
