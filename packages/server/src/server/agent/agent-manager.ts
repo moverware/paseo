@@ -2086,22 +2086,18 @@ export class AgentManager {
   private isRoutedPromptEcho(agentId: string, text: string): boolean {
     const rows = this.timelineStore.getRows(agentId);
     const normalized = normalizeRoutedPromptText(text);
-    // Slash commands flush to the external transcript only with the NEXT
-    // turn, so their echo arrives rows after the committed copy — scan a
-    // deeper window for those. Plain prompts echo immediately; two rows.
-    const lookback = normalized.startsWith("/") ? 12 : 2;
-    for (let i = rows.length - 1; i >= 0 && i >= rows.length - lookback; i--) {
+    // The echo is the first user message the tail emits after the routed
+    // commit, but other transcript rows can land in between — slash commands
+    // flush only with the NEXT turn, and the external process's own task
+    // notifications interleave (measured 2026-08-06). Scan back a bounded
+    // window and judge against the first committed user row found.
+    for (let i = rows.length - 1; i >= 0 && i >= rows.length - 12; i--) {
       const item = rows[i].item;
       if (item.type !== "user_message") {
         continue;
       }
       const routed = normalizeRoutedPromptText(item.text);
-      if (normalized === routed || normalized.startsWith(`${routed}\n`)) {
-        return true;
-      }
-      if (lookback === 2) {
-        return false;
-      }
+      return normalized === routed || normalized.startsWith(`${routed}\n`);
     }
     return false;
   }
