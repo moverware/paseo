@@ -741,6 +741,31 @@ function readTranscriptModelEvidence(entry: unknown): string | null {
   return args || null;
 }
 
+/**
+ * Replay at most this many user turns into the timeline. Long sessions
+ * replayed in full re-render the client's whole thread on every reload
+ * (epoch remint), which loses scroll position and moves thousands of rows
+ * nobody reads on a phone. The transcript stays the source of truth — the
+ * cap bounds only what hydration projects.
+ */
+const REPLAYED_HISTORY_MAX_TURNS = 20;
+
+function sliceHistoryToRecentTurns<T extends { item: AgentTimelineItem }>(
+  entries: T[],
+  maxTurns: number,
+): T[] {
+  let turns = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].item.type === "user_message") {
+      turns += 1;
+      if (turns >= maxTurns) {
+        return entries.slice(i);
+      }
+    }
+  }
+  return entries;
+}
+
 const HOOK_BLOCK_PREFIX = "UserPromptSubmit operation blocked by hook:\n";
 
 /**
@@ -2287,7 +2312,7 @@ class ClaudeAgentSession implements AgentSession {
     ) {
       return;
     }
-    const history = this.persistedHistory;
+    const history = sliceHistoryToRecentTurns(this.persistedHistory, REPLAYED_HISTORY_MAX_TURNS);
     const providerSubagentEvents = this.persistedProviderSubagentEvents;
     this.persistedHistory = [];
     this.persistedProviderSubagentEvents = [];
