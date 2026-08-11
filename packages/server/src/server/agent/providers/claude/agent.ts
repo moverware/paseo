@@ -779,7 +779,7 @@ function readTranscriptModelEvidence(entry: unknown): string | null {
  */
 const REPLAYED_HISTORY_MAX_TURNS = 20;
 
-function sliceHistoryToRecentTurns<T extends { item: AgentTimelineItem }>(
+export function sliceHistoryToRecentTurns<T extends { item: AgentTimelineItem }>(
   entries: T[],
   maxTurns: number,
 ): T[] {
