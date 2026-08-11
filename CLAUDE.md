@@ -101,6 +101,51 @@ Repo dev commands use checkout-local state by default. In this checkout, `PASEO_
 
 See [docs/development.md](docs/development.md) for full setup, build sync requirements, and debugging.
 
+## This is a fork
+
+`moverware/paseo`, branch `mover/daemon-patches`, tracking `getpaseo/paseo` as
+`upstream`. It runs one deployment: the `mover_paseo` daemon on movercore,
+which drives Mitchell's phone against Claude Code sessions living in herdr
+terminal panes. The fork exists because upstream assumes the daemon _runs_ the
+agents, and here it usually doesn't — the pane does, and the daemon is a
+renderer and remote control over it.
+
+**Priority order for any change here.**
+
+1. **Mitchell's system works.** He drives real work from his phone; a broken
+   daemon can strand him with no terminal. Verify before deploying, and keep a
+   rollback commit in reach.
+2. **Carry as little bespoke code as possible.** Every patched line is a merge
+   conflict waiting for the next upstream release. When upstream grows a
+   primitive that covers something we hand-built, move onto theirs and delete
+   ours — even if ours is marginally nicer. Prefer additive seams (new files,
+   new optional interface members, config keys) over edits inside upstream
+   functions, because those rebase cleanly.
+
+Concretely: before adding to this fork, check whether upstream already has the
+capability or would accept the change; if a patch must edit an upstream
+function, keep the edit to one or two lines that call into a fork-owned module.
+After each upstream merge, re-run that audit — the point is for the patch set
+to shrink over time, not accumulate.
+
+**What the fork adds today** (external = a turn executing in a process the
+daemon doesn't own):
+
+| Area                          | Surface                                                                                                                                                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Live external turns           | `agent/transcript-tailer.ts` tails the provider transcript and commits appended lines through the normal timeline/broadcast path; providers opt in via `externalTranscriptPath` / `convertExternalTranscriptLines` |
+| External turn status          | `externalTurnUntil` on the managed agent, projected as `running`; fed by `update_agent_request.externalTurn` reports and tail activity                                                                             |
+| Reaching the external process | `daemon.externalInterruptCommand` (stop button) and `daemon.externalPromptCommand` (slash commands, model switches) — argv spawned with `PASEO_AGENT_*` env                                                        |
+| Echo accounting               | prompts handed outward are ledgered and their transcript echo consumed exactly once, so a routed message renders once                                                                                              |
+| Routed-turn rendering         | a `⤳`-marked hook refusal renders as one line, or silently                                                                                                                                                         |
+| Model mirroring               | the external process's model is read from its transcript and adopted onto the session/config                                                                                                                       |
+| Bounded replay                | history hydration slices to the most recent turns                                                                                                                                                                  |
+| CLI/protocol                  | `import --workspace`, `agent update --external-turn`, sessionId/workspaceId/labels in `ls`/`inspect` JSON                                                                                                          |
+
+The consumer of all of this is `fleet-config`'s session-handoff skill
+(hooks + the `mover_session_handoff` watcher). Behavior changes here usually
+need a matching change there.
+
 ## Critical rules
 
 - **NEVER restart the main Paseo daemon on port 6767 without permission** — it manages all running agents. If you're an agent, restarting it kills your own process.
