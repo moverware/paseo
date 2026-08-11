@@ -461,6 +461,15 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     revertFiles: inner.revertFiles?.bind(inner),
     revertBoth: inner.revertBoth?.bind(inner),
     tryHandleOutOfBand: inner.tryHandleOutOfBand?.bind(inner),
+    // FORK: the wrapper enumerates the session surface explicitly, so an
+    // optional member it does not list is silently dropped — and a dropped
+    // externalTranscriptPath reads to the tailer as "this provider has no
+    // transcript", disarming live streaming with no error. Wrapping engages
+    // for any custom provider id or configured model override, so this is
+    // reachable from ordinary config, not just exotic setups.
+    externalTranscriptPath: inner.externalTranscriptPath?.bind(inner),
+    convertExternalTranscriptLines: inner.convertExternalTranscriptLines?.bind(inner),
+    noteExternalModelSwitch: inner.noteExternalModelSwitch?.bind(inner),
   };
 }
 
