@@ -664,6 +664,13 @@ export interface AgentSession {
    */
   noteExternalModelSwitch?(modelId: string): void;
   /**
+   * Identity the session needs to reach the process running its turns: the
+   * daemon's agent id and the labels that locate the terminal session and
+   * pane. The provider session never sees these otherwise. Re-sent whenever
+   * the labels change.
+   */
+  noteExternalIdentity?(identity: { agentId: string; labels: Record<string, string> }): void;
+  /**
    * Drive this session's autonomous turn on behalf of a process the daemon
    * does not run. "running" opens one (the manager's normal turn_started
    * handling then marks the agent running), "idle" completes it, "superseded"

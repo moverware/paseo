@@ -398,8 +398,6 @@ export interface PaseoDaemonConfig {
   autoArchiveAfterMerge?: boolean;
   enableTerminalAgentHooks?: boolean;
   appendSystemPrompt?: string;
-  externalInterruptCommand?: string[];
-  externalPromptCommand?: string[];
   terminalProfiles?: TerminalProfile[];
   staticDir: string;
   mcpDebug: boolean;
@@ -836,8 +834,6 @@ export async function createPaseoDaemon(
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
     appendSystemPrompt: config.appendSystemPrompt,
-    externalInterruptCommand: config.externalInterruptCommand,
-    externalPromptCommand: config.externalPromptCommand,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },

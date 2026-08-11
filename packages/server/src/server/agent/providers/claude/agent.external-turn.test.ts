@@ -1,5 +1,8 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import type { AgentSession, AgentStreamEvent } from "../../agent-sdk-types.js";
@@ -124,6 +127,78 @@ describe("external turns drive the session's autonomous turn", () => {
     try {
       session.noteExternalTurn?.("superseded");
       expect(turnEvents(events)).toEqual([]);
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe("interrupting an external turn", () => {
+  let paseoHome: string | null = null;
+  const originalPaseoHome = process.env.PASEO_HOME;
+
+  afterEach(() => {
+    if (originalPaseoHome === undefined) {
+      delete process.env.PASEO_HOME;
+    } else {
+      process.env.PASEO_HOME = originalPaseoHome;
+    }
+    if (paseoHome) {
+      rmSync(paseoHome, { recursive: true, force: true });
+      paseoHome = null;
+    }
+  });
+
+  /** A daemon home whose interrupt command records the environment it got. */
+  function configureInterruptCommand(): { evidencePath: string } {
+    paseoHome = mkdtempSync(join(tmpdir(), "external-interrupt-"));
+    const evidencePath = join(paseoHome, "interrupted.txt");
+    const scriptPath = join(paseoHome, "interrupt.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/sh\nprintf '%s\\n%s\\n' "$PASEO_AGENT_ID" "$PASEO_AGENT_LABELS" > ${JSON.stringify(evidencePath)}\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(paseoHome, "config.json"),
+      JSON.stringify({ daemon: { externalInterruptCommand: ["/bin/sh", scriptPath] } }),
+    );
+    process.env.PASEO_HOME = paseoHome;
+    return { evidencePath };
+  }
+
+  test("runs the configured command with the agent's identity, with no live query", async () => {
+    const { evidencePath } = configureInterruptCommand();
+    const { session, close } = await createSession();
+    try {
+      session.noteExternalIdentity?.({
+        agentId: "agent-42",
+        labels: { origin: "herdr", "herdr-session": "work" },
+      });
+      session.noteExternalTurn?.("running");
+
+      await session.interrupt();
+
+      await vi.waitFor(() => {
+        const [agentId, labels] = readFileSync(evidencePath, "utf8").split("\n");
+        expect(agentId).toBe("agent-42");
+        expect(JSON.parse(labels)).toEqual({ origin: "herdr", "herdr-session": "work" });
+      });
+      // The interrupted turn ends here: the pane never runs its own turn-end
+      // hook after a cancel, so nothing else would report it idle.
+      expect(session.isExternalTurnActive?.()).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+
+  test("leaves the command alone when the open turn is the daemon's own", async () => {
+    const { evidencePath } = configureInterruptCommand();
+    const { session, close } = await createSession();
+    try {
+      await session.interrupt();
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+      expect(() => readFileSync(evidencePath, "utf8")).toThrow();
     } finally {
       await close();
     }

@@ -14,9 +14,6 @@ export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   hasInFlightRun(agentId: string): boolean;
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
-  interruptExternalTurn(agentId: string): boolean;
-  hasActiveExternalTurn(agentId: string): boolean;
-  reportExternalTurn(agentId: string, state: "running" | "idle"): void;
   clearAgentAttention(agentId: string): Promise<void>;
   archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
   archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord>;
@@ -49,15 +46,6 @@ export interface AgentLifecycleCommandDependencies {
   logger: Logger;
 }
 
-export class ExternalTurnInterruptError extends Error {
-  constructor(public readonly agentId: string) {
-    super(
-      `Agent ${agentId} is running in an external process that could not be interrupted from here`,
-    );
-    this.name = "ExternalTurnInterruptError";
-  }
-}
-
 export interface CancelAgentRunResult {
   agent: LifecycleAgentSnapshot;
   cancelled: boolean;
@@ -80,22 +68,11 @@ async function requestAgentRunCancellation(
 
   const hasInFlightRun = agentManager.hasInFlightRun(agentId);
   if (!hasInFlightRun) {
-    // No daemon-side run, but the turn may be running in an external process
-    // (a terminal pane driving the provider CLI) — route the interrupt there.
-    const externalInterrupt = agentManager.interruptExternalTurn(agentId);
     logger.trace(
-      { agentId, lifecycle: agent.lifecycle, hasInFlightRun, externalInterrupt },
-      externalInterrupt
-        ? "cancelAgentRunCommand: routed to external turn"
-        : "cancelAgentRunCommand: skipping because agent is not running",
+      { agentId, lifecycle: agent.lifecycle, hasInFlightRun },
+      "cancelAgentRunCommand: skipping because agent is not running",
     );
-    if (!externalInterrupt && agentManager.hasActiveExternalTurn(agentId)) {
-      // The turn runs elsewhere and we have no way to reach it (no interrupt
-      // command configured, or the spawn failed). Failing loudly lets the
-      // client clear its cancelling state instead of spinning until decay.
-      throw new ExternalTurnInterruptError(agentId);
-    }
-    return { agent, cancelled: externalInterrupt, cancellation: { status: "not_running" } };
+    return { agent, cancelled: false, cancellation: { status: "not_running" } };
   }
 
   logger.debug(
@@ -185,29 +162,22 @@ export async function updateAgentCommand(
     agentId: string;
     name?: string;
     labels?: Record<string, string>;
-    externalTurn?: "running" | "idle";
   },
 ): Promise<UpdateAgentResult> {
   const title = input.name?.trim();
   const labels = input.labels && Object.keys(input.labels).length > 0 ? input.labels : undefined;
 
-  if (!title && !labels && !input.externalTurn) {
+  if (!title && !labels) {
     return {
       accepted: false,
-      error: "Nothing to update (provide name, labels and/or externalTurn)",
+      error: "Nothing to update (provide name and/or labels)",
     };
   }
 
-  if (input.externalTurn) {
-    dependencies.agentManager.reportExternalTurn(input.agentId, input.externalTurn);
-  }
-
-  if (title || labels) {
-    await dependencies.agentManager.updateAgentMetadata(input.agentId, {
-      ...(title ? { title } : {}),
-      ...(labels ? { labels } : {}),
-    });
-  }
+  await dependencies.agentManager.updateAgentMetadata(input.agentId, {
+    ...(title ? { title } : {}),
+    ...(labels ? { labels } : {}),
+  });
 
   return {
     accepted: true,

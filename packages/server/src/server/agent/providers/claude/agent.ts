@@ -125,6 +125,10 @@ import {
   type ProviderCatalog,
   type ResolveAgentDefaultModeInput,
 } from "../../agent-sdk-types.js";
+import {
+  spawnExternalTurnCommand,
+  type ExternalAgentIdentity,
+} from "../../external-turn-command.js";
 import { resolvePaseoHome } from "../../../paseo-home.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import {
@@ -2105,6 +2109,10 @@ class ClaudeAgentSession implements AgentSession {
   private pendingPermissions = new Map<string, PendingPermission>();
   private activeForegroundTurnId: string | null = null;
   private autonomousTurn: AutonomousTurnState | null = null;
+  /** FORK: the managed agent's id and labels, pushed in by the manager — the
+   * labels say which terminal session and pane run this session's turns. */
+  private externalAgentId: string | null = null;
+  private externalLabels: Record<string, string> = {};
   /** FORK: an external-turn report has arrived for this session at least once,
    * so its process reports real turn boundaries and tail activity must not be
    * used to infer them. See noteExternalTurn. */
@@ -2343,6 +2351,16 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     if (this.autonomousTurn) {
+      // FORK: a turn running in an external process is stopped where it runs.
+      // Reached from upstream's cancelAgentRun with no manager patch, so the
+      // phone's stop button, a replaced run and a reload all route here.
+      if (this.autonomousTurn.external) {
+        spawnExternalTurnCommand({
+          kind: "interrupt",
+          identity: this.externalIdentity(),
+          logger: this.logger,
+        });
+      }
       this.flushPendingToolCalls();
       this.completeAutonomousTurn();
     }
@@ -2432,6 +2450,21 @@ class ClaudeAgentSession implements AgentSession {
 
   isExternalTurnActive(): boolean {
     return this.autonomousTurn?.external === true;
+  }
+
+  noteExternalIdentity(identity: { agentId: string; labels: Record<string, string> }): void {
+    this.externalAgentId = identity.agentId;
+    this.externalLabels = identity.labels;
+  }
+
+  /** Everything the configured external commands need to find the pane. */
+  private externalIdentity(): ExternalAgentIdentity {
+    return {
+      agentId: this.externalAgentId ?? this.agentId ?? null,
+      sessionId: this.claudeSessionId,
+      cwd: this.config.cwd,
+      labels: this.externalLabels,
+    };
   }
 
   /**

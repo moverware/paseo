@@ -470,6 +470,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     externalTranscriptPath: inner.externalTranscriptPath?.bind(inner),
     convertExternalTranscriptLines: inner.convertExternalTranscriptLines?.bind(inner),
     noteExternalModelSwitch: inner.noteExternalModelSwitch?.bind(inner),
+    noteExternalIdentity: inner.noteExternalIdentity?.bind(inner),
     noteExternalTurn: inner.noteExternalTurn?.bind(inner),
     isExternalTurnActive: inner.isExternalTurnActive?.bind(inner),
   };
