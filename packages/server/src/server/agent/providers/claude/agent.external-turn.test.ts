@@ -133,6 +133,70 @@ describe("external turns drive the session's autonomous turn", () => {
   });
 });
 
+describe("an external turn reported while the daemon is running its own", () => {
+  /** A query that stays open, so the foreground turn does not settle on its own. */
+  function createHangingQueryMock(): Query {
+    return {
+      ...createIdleQueryMock(),
+      next: vi.fn(() => new Promise<never>(() => {})),
+    } as Query;
+  }
+
+  async function createHangingSession(): Promise<{
+    session: AgentSession;
+    events: AgentStreamEvent[];
+    close: () => Promise<void>;
+  }> {
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory: () => createHangingQueryMock(),
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    return { session, events, close: () => session.close() };
+  }
+
+  test("opens once the daemon's turn settles, which is every routed message", async () => {
+    const { session, events, close } = await createHangingSession();
+    try {
+      await session.startTurn("from the phone");
+      events.length = 0;
+
+      // The pane's prompt hook reports the turn it accepted while the daemon
+      // turn it is about to refuse is still open.
+      session.noteExternalTurn?.("running");
+      expect(turnEvents(events)).toEqual([]);
+      expect(session.isExternalTurnActive?.()).toBe(false);
+
+      await session.interrupt();
+
+      expect(turnEvents(events)).toEqual(["turn_canceled", "turn_started"]);
+      expect(session.isExternalTurnActive?.()).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  test("drops the deferred turn when the pane reports it finished first", async () => {
+    const { session, events, close } = await createHangingSession();
+    try {
+      await session.startTurn("from the phone");
+      events.length = 0;
+
+      session.noteExternalTurn?.("running");
+      session.noteExternalTurn?.("idle");
+      await session.interrupt();
+
+      expect(turnEvents(events)).toEqual(["turn_canceled"]);
+      expect(session.isExternalTurnActive?.()).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+});
+
 describe("ingesting transcript lines an external process wrote", () => {
   function userLine(text: string, uuid: string): string {
     return JSON.stringify({

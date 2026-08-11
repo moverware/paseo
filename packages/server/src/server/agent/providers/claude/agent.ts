@@ -2117,6 +2117,9 @@ class ClaudeAgentSession implements AgentSession {
   private externalLabels: Record<string, string> = {};
   /** FORK: prompts routed out to the external process, awaiting their echo. */
   private readonly externalEchoes = new ExternalEchoLedger();
+  /** FORK: an external turn was reported while a daemon-side foreground turn
+   * held the lifecycle; opened once that turn settles. */
+  private deferredExternalTurn = false;
   /** FORK: an external-turn report has arrived for this session at least once,
    * so its process reports real turn boundaries and tail activity must not be
    * used to infer them. See noteExternalTurn. */
@@ -2460,14 +2463,21 @@ class ClaudeAgentSession implements AgentSession {
         return;
       }
       this.externalTurnReportsSeen ||= state === "running";
-      // A daemon-side foreground turn owns the lifecycle while it runs; the
-      // pane's turn is the one being interrupted in that case, not this one.
-      if (this.activeForegroundTurnId || this.closed) {
+      if (this.closed) {
+        return;
+      }
+      // A daemon-side foreground turn owns the lifecycle while it runs. Hold
+      // the report until it settles rather than dropping it: the pane's prompt
+      // hook reports its new turn while the daemon turn it is about to refuse
+      // is still open, which is every routed message.
+      if (this.activeForegroundTurnId) {
+        this.deferredExternalTurn ||= state === "running";
         return;
       }
       this.startAutonomousTurn({ external: true });
       return;
     }
+    this.deferredExternalTurn = false;
     if (!this.autonomousTurn?.external) {
       return;
     }
@@ -3780,6 +3790,7 @@ class ClaudeAgentSession implements AgentSession {
     this.cancelCurrentTurn = null;
     this.activeTurnHasAssistantText = false;
     this.syncTurnState("foreground turn terminal");
+    this.openDeferredExternalTurn();
   }
 
   private dispatchEvents(events: AgentStreamEvent[]): void {
@@ -3800,7 +3811,23 @@ class ClaudeAgentSession implements AgentSession {
         this.activeTurnHasAssistantText = false;
         this.syncTurnState("autonomous turn terminal");
       }
+      this.openDeferredExternalTurn();
     }
+  }
+
+  /**
+   * FORK: an external turn reported while this daemon was running its own turn
+   * was deferred rather than dropped. That is the ordinary routed-message
+   * shape — the pane's prompt hook reports the turn it just accepted while the
+   * daemon-side turn it is about to refuse is still open — and dropping it
+   * left the agent reading idle until the pane's next heartbeat.
+   */
+  private openDeferredExternalTurn(): void {
+    if (!this.deferredExternalTurn || this.activeForegroundTurnId || this.autonomousTurn) {
+      return;
+    }
+    this.deferredExternalTurn = false;
+    this.startAutonomousTurn({ external: true });
   }
 
   private startAutonomousTurn(options?: { external?: boolean }): void {
