@@ -36,26 +36,32 @@ be in flight.
 ### External turns
 
 An imported agent's turns may run in an external process the daemon never sees — a terminal pane
-driving the provider CLI against the same durable session. Three mechanisms make those turns behave
-like daemon-run turns; all live in `agent-manager.ts` unless noted:
+driving the provider CLI against the same durable session. Those turns are expressed as the
+provider session's own **autonomous turn**, so lifecycle, active turn, run tracking and cancellation
+all take the paths a daemon-run turn takes. There is no parallel status field.
 
 - The transcript tailer (`transcript-tailer.ts`) watches the provider-owned transcript of every
-  registered session and broadcasts appended lines through the normal timeline commit + `agent_stream`
-  path. Providers opt in with `externalTranscriptPath` / `convertExternalTranscriptLines` on their
-  session (Claude only today). Tailing pauses while a daemon-side run is in flight and resyncs when
-  runs settle, so daemon-run turns never double-emit.
-- `externalTurnUntil` projects status `running` while an external turn is active. It is fed by tail
-  activity (90-second decay) and by explicit reports: `update_agent_request.externalTurn`
-  (`paseo agent update --external-turn running|idle`), for the external process's own lifecycle hooks.
-  Once a report has been seen, reports own the status and tail activity stops driving it — the tail
-  flushes a turn's last lines after the idle report, and must not re-mark the turn active. Reported
-  running decays after 5 minutes without a fresh report, covering long single tool calls.
-  Projection-only — `lastStatus` on disk keeps the lifecycle, so restarts never resurrect a stale
-  `running`.
-- A cancel request with no daemon-side run spawns `daemon.externalInterruptCommand` from config
-  (argv array; receives `PASEO_AGENT_ID`, `PASEO_AGENT_SESSION_ID`, `PASEO_AGENT_CWD`,
-  `PASEO_AGENT_LABELS`) so the stop button can reach the external process. Unset means the previous
-  no-op behavior.
+  registered session and hands appended lines back to the session, which converts them and emits
+  them to its subscribers like any other event. Providers opt in with `externalTranscriptPath` /
+  `ingestExternalTranscriptLines` (Claude only today). Tailing pauses while the _daemon_ is running
+  the turn and resyncs when runs settle, so daemon-run turns never double-emit — an external turn is
+  an in-flight run too, which is why that gate cannot key on `hasInFlightRun`.
+- `AgentSession.noteExternalTurn(state)` opens and closes that turn. `running` / `idle` come from
+  the external process's lifecycle hooks via `update_agent_request.externalTurn`
+  (`paseo agent update --external-turn running|idle`); `activity` is inferred from tailed lines and
+  is ignored once real reports have arrived, because the tail flushes a turn's last lines seconds
+  after the idle report; `superseded` drops the turn silently when the daemon is about to run one
+  itself. Nothing decays: the turn ends when the external process says so, when the turn is
+  interrupted, or when the daemon takes it over.
+- `ClaudeAgentSession.interrupt()` spawns `daemon.externalInterruptCommand` for an external turn,
+  so upstream's `cancelAgentRun` reaches the pane with no manager involvement. Slash commands take
+  `tryHandleOutOfBand` and spawn `daemon.externalPromptCommand`. Both are argv arrays in the daemon
+  config, and both receive `PASEO_AGENT_ID`, `PASEO_AGENT_SESSION_ID`, `PASEO_AGENT_CWD` and
+  `PASEO_AGENT_LABELS` (plus `PASEO_PROMPT` for delivery). Unset means the daemon handles the
+  request itself, as it does for any other agent.
+- A prompt arriving mid external turn does **not** interrupt from here. The external process's own
+  prompt hook interrupts as part of delivering it, and a second interrupt racing that one merges
+  both prompts in its composer; `replaceAgentRun` releases the turn instead.
 
 ### Cancellation
 

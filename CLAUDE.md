@@ -131,16 +131,28 @@ to shrink over time, not accumulate.
 **What the fork adds today** (external = a turn executing in a process the
 daemon doesn't own):
 
-| Area                          | Surface                                                                                                                                                                                                            |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Live external turns           | `agent/transcript-tailer.ts` tails the provider transcript and commits appended lines through the normal timeline/broadcast path; providers opt in via `externalTranscriptPath` / `convertExternalTranscriptLines` |
-| External turn status          | `externalTurnUntil` on the managed agent, projected as `running`; fed by `update_agent_request.externalTurn` reports and tail activity                                                                             |
-| Reaching the external process | `daemon.externalInterruptCommand` (stop button) and `daemon.externalPromptCommand` (slash commands, model switches) — argv spawned with `PASEO_AGENT_*` env                                                        |
-| Echo accounting               | prompts handed outward are ledgered and their transcript echo consumed exactly once, so a routed message renders once                                                                                              |
-| Routed-turn rendering         | a `⤳`-marked hook refusal renders as one line, or silently                                                                                                                                                         |
-| Model mirroring               | the external process's model is read from its transcript and adopted onto the session/config                                                                                                                       |
-| Bounded replay                | history hydration slices to the most recent turns                                                                                                                                                                  |
-| CLI/protocol                  | `import --workspace`, `agent update --external-turn`, sessionId/workspaceId/labels in `ls`/`inspect` JSON                                                                                                          |
+An external turn is expressed as the provider session's own **autonomous
+turn**, which is upstream's mechanism for a turn the daemon did not start. That
+is what makes lifecycle, active turn, run tracking, cancellation and the event
+stream work with no manager patches. See
+[docs/agent-lifecycle.md](docs/agent-lifecycle.md#external-turns).
+
+| Area                          | Surface                                                                                                                                                                                                                     |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Live external turns           | `agent/transcript-tailer.ts` tails the provider transcript and hands lines back to the session, which emits them as ordinary stream events; providers opt in via `externalTranscriptPath` / `ingestExternalTranscriptLines` |
+| External turn state           | `AgentSession.noteExternalTurn(state)` opens/closes the autonomous turn; fed by `update_agent_request.externalTurn` reports and, as a backstop, tail activity                                                               |
+| Reaching the external process | `daemon.externalInterruptCommand` (stop button) and `daemon.externalPromptCommand` (slash commands, model switches), read by `agent/external-turn-command.ts` and spawned with `PASEO_AGENT_*` env                          |
+| Echo accounting               | `agent/external-echo-ledger.ts` — prompts handed outward have their transcript echo consumed exactly once, so a routed message renders once                                                                                 |
+| Routed-turn rendering         | a `⤳`-marked hook refusal renders as one line, or silently                                                                                                                                                                  |
+| Model mirroring               | the external process's model is read from its transcript and announced as `model_changed`                                                                                                                                   |
+| Bounded replay                | history hydration slices to the most recent turns                                                                                                                                                                           |
+| CLI/protocol                  | `import --workspace`, `agent update --external-turn`, sessionId/workspaceId/labels in `ls`/`inspect` JSON                                                                                                                   |
+
+Everything above lives in fork-owned modules or in optional `AgentSession`
+members the Claude provider implements. Six upstream files that the fork used to
+patch — `agent-projections.ts`, `agent-prompt.ts`, `lifecycle-command.ts` and
+its test, `bootstrap.ts`, `config.ts` — are byte-identical to upstream again;
+keep them that way.
 
 The consumer of all of this is `fleet-config`'s session-handoff skill
 (hooks + the `mover_session_handoff` watcher). Behavior changes here usually
