@@ -654,10 +654,13 @@ export interface AgentSession {
    */
   externalTranscriptPath?(): string | null;
   /**
-   * Convert whole transcript lines appended by an external process into
-   * timeline entries, using the same conversion streamHistory replay applies.
+   * Ingest whole transcript lines appended by an external process, converting
+   * them the way streamHistory replay does and emitting them to this session's
+   * subscribers. Going out as ordinary stream events is what gives an external
+   * turn the same coalescing, turn stamping, echo reconciliation and workspace
+   * hooks a daemon-run turn gets.
    */
-  convertExternalTranscriptLines?(content: string): ImportedTimelineEntry[];
+  ingestExternalTranscriptLines?(content: string): void;
   /**
    * Adopt a model switch that was delivered to the external process, ahead
    * of transcript evidence (which lands only with the next turn).

@@ -133,6 +133,113 @@ describe("external turns drive the session's autonomous turn", () => {
   });
 });
 
+describe("ingesting transcript lines an external process wrote", () => {
+  function userLine(text: string, uuid: string): string {
+    return JSON.stringify({
+      type: "user",
+      uuid,
+      message: { role: "user", content: text },
+    });
+  }
+
+  function assistantLine(text: string, uuid: string): string {
+    return JSON.stringify({
+      type: "assistant",
+      uuid,
+      message: { role: "assistant", model: "claude-opus-4-6", content: [{ type: "text", text }] },
+    });
+  }
+
+  function timelineTexts(events: AgentStreamEvent[]): string[] {
+    return events.flatMap((event) =>
+      event.type === "timeline" && "text" in event.item ? [event.item.text] : [],
+    );
+  }
+
+  function reportedModel(events: AgentStreamEvent[]): string | null | undefined {
+    const changed = events.findLast((event) => event.type === "model_changed");
+    return changed?.runtimeInfo.model;
+  }
+
+  test("emits the lines as timeline events inside an open external turn", async () => {
+    const { session, events, close } = await createSession();
+    try {
+      session.ingestExternalTranscriptLines?.(
+        `${userLine("run the tests", "u1")}\n${assistantLine("running them", "a1")}\n`,
+      );
+
+      expect(turnEvents(events)).toEqual(["turn_started"]);
+      expect(timelineTexts(events)).toEqual(["run the tests", "running them"]);
+      // Every emitted event carries the open turn's id, so the manager can
+      // stamp and coalesce them like any other turn's.
+      const turnIds = new Set(
+        events.map((event) => ("turnId" in event ? event.turnId : undefined)),
+      );
+      expect(turnIds.size).toBe(1);
+      expect([...turnIds][0]).toBeDefined();
+    } finally {
+      await close();
+    }
+  });
+
+  test("announces a model the external process switched to", async () => {
+    const { session, events, close } = await createSession();
+    try {
+      session.ingestExternalTranscriptLines?.(`${assistantLine("hello", "a1")}\n`);
+      await vi.waitFor(() => {
+        expect(reportedModel(events)).toBe("claude-opus-4-6");
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  test("drops the echo of a prompt the daemon routed outward", async () => {
+    paseoHomeForPrompt();
+    const { session, events, close } = await createSession();
+    try {
+      session.noteExternalIdentity?.({ agentId: "agent-9", labels: { origin: "herdr" } });
+      await session.tryHandleOutOfBand?.("/compact")?.run({ emit: () => {} });
+
+      session.ingestExternalTranscriptLines?.(
+        `${userLine("/compact", "u1")}\n${assistantLine("compacted", "a1")}\n`,
+      );
+      expect(timelineTexts(events)).toEqual(["compacted"]);
+
+      // Only one echo is owed, so the pane's own second /compact renders.
+      session.ingestExternalTranscriptLines?.(`${userLine("/compact", "u2")}\n`);
+      expect(timelineTexts(events)).toEqual(["compacted", "/compact"]);
+    } finally {
+      await close();
+      cleanupPromptHome();
+    }
+  });
+
+  let promptHome: string | null = null;
+  const promptHomeOriginal = process.env.PASEO_HOME;
+
+  function paseoHomeForPrompt(): void {
+    promptHome = mkdtempSync(join(tmpdir(), "external-ingest-"));
+    writeFileSync(
+      join(promptHome, "config.json"),
+      JSON.stringify({ daemon: { externalPromptCommand: ["/usr/bin/true"] } }),
+    );
+    process.env.PASEO_HOME = promptHome;
+  }
+
+  function cleanupPromptHome(): void {
+    if (promptHomeOriginal === undefined) {
+      delete process.env.PASEO_HOME;
+    } else {
+      process.env.PASEO_HOME = promptHomeOriginal;
+    }
+    if (promptHome) {
+      rmSync(promptHome, { recursive: true, force: true });
+      promptHome = null;
+    }
+  }
+});
+
 describe("interrupting an external turn", () => {
   let paseoHome: string | null = null;
   const originalPaseoHome = process.env.PASEO_HOME;

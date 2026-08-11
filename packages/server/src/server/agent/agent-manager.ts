@@ -675,9 +675,6 @@ export class AgentManager {
     this.transcriptTailer = new TranscriptTailer({
       logger: this.logger,
       hasDaemonRun: (agentId) => this.hasDaemonRun(agentId),
-      emitEntries: (agentId, entries) => {
-        this.appendExternalTimelineEntries(agentId, entries);
-      },
     });
     this.updateProviderRegistry({
       providerDefinitions: options.providerDefinitions ?? {},
@@ -2065,60 +2062,6 @@ export class AgentManager {
       }
     })();
     return true;
-  }
-
-  /**
-   * Commit and broadcast timeline entries the transcript tailer read from a
-   * turn run by an external process (e.g. the provider CLI in a terminal
-   * pane). Same persistence + broadcast pipeline as daemon-run turns, so
-   * clients render external turns live.
-   */
-  private appendExternalTimelineEntries(
-    agentId: string,
-    entries: readonly ImportedTimelineEntry[],
-  ): void {
-    const agent = this.agents.get(agentId);
-    if (!agent || agent.session == null) {
-      return;
-    }
-    if (this.hasDaemonRun(agentId)) {
-      return;
-    }
-    // Backstop for a pane whose lifecycle hooks are not wired: lines arriving
-    // for a turn nobody reported opens the external turn, so the agent reads
-    // running while its output streams. A pane that does report just finds the
-    // turn already open.
-    agent.session.noteExternalTurn?.("activity");
-    let recorded = false;
-    for (const entry of entries) {
-      if (entry.item.type === "user_message" && isSystemInjectedEnvelope(entry.item.text)) {
-        continue;
-      }
-      const row = this.recordTimeline(
-        agentId,
-        entry.item,
-        entry.timestamp ? { timestamp: entry.timestamp } : undefined,
-      );
-      this.dispatchStream(
-        agentId,
-        { type: "timeline", item: row.item, provider: agent.provider },
-        {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agentId),
-          timestamp: row.timestamp,
-        },
-      );
-      recorded = true;
-    }
-    if (recorded) {
-      this.touchUpdatedAt(agent);
-      this.emitState(agent);
-    }
-    // Outside the recorded gate on purpose: a delegated /model echo dedupes
-    // to zero recorded entries, but the conversion still captured the model —
-    // the refresh is what carries it to the client's selector. Cheap for
-    // claude (cached fields, no SDK spawn); emits state only on change.
-    void this.refreshRuntimeInfo(agent);
   }
 
   /**

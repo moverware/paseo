@@ -117,7 +117,6 @@ import {
   type ExternalTurnState,
   type FetchCatalogOptions,
   type ImportableProviderSession,
-  type ImportedTimelineEntry,
   type ImportProviderSessionContext,
   type ImportProviderSessionInput,
   type ListImportableSessionsOptions,
@@ -2410,19 +2409,39 @@ class ClaudeAgentSession implements AgentSession {
     return this.resolveHistoryPath(this.claudeSessionId);
   }
 
-  convertExternalTranscriptLines(content: string): ImportedTimelineEntry[] {
+  ingestExternalTranscriptLines(content: string): void {
     const timeline: PersistedTimelineEntry[] = [];
     // No restored-subagent set on the live tail: sidechain entries are skipped
     // by the ingest itself, and the subagents track is rebuilt on replay.
     const restoredProviderSubagentIds: ReadonlySet<string> = new Set();
+    const modelBefore = this.lastOptionsModel;
     for (const line of content.split(/\r?\n/)) {
       this.ingestPersistedHistoryLine(line, timeline, restoredProviderSubagentIds);
       this.captureExternalRuntimeModel(line);
     }
-    return timeline.filter(
-      (entry) =>
-        entry.item.type !== "user_message" || !this.externalEchoes.consume(entry.item.text),
-    );
+    // Lines arriving for a turn nobody reported means work is happening in the
+    // pane; open the turn before the rows go out so they carry its id.
+    this.noteExternalTurn("activity");
+    for (const entry of timeline) {
+      if (entry.item.type === "user_message" && this.externalEchoes.consume(entry.item.text)) {
+        continue;
+      }
+      this.notifySubscribers({ type: "timeline", provider: "claude", item: entry.item });
+    }
+    if (this.lastOptionsModel !== modelBefore) {
+      // The pane switched models. Emitted rather than left for a runtime-info
+      // refresh so the client's selector moves on the same path a daemon-side
+      // switch uses.
+      void this.emitExternalModelChange();
+    }
+  }
+
+  private async emitExternalModelChange(): Promise<void> {
+    this.notifySubscribers({
+      type: "model_changed",
+      provider: "claude",
+      runtimeInfo: await this.getRuntimeInfo(),
+    });
   }
 
   /**

@@ -468,7 +468,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     // for any custom provider id or configured model override, so this is
     // reachable from ordinary config, not just exotic setups.
     externalTranscriptPath: inner.externalTranscriptPath?.bind(inner),
-    convertExternalTranscriptLines: inner.convertExternalTranscriptLines?.bind(inner),
+    ingestExternalTranscriptLines: inner.ingestExternalTranscriptLines?.bind(inner),
     noteExternalModelSwitch: inner.noteExternalModelSwitch?.bind(inner),
     noteExternalIdentity: inner.noteExternalIdentity?.bind(inner),
     noteExternalTurn: inner.noteExternalTurn?.bind(inner),

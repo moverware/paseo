@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import type { Logger } from "pino";
-import type { AgentSession, ImportedTimelineEntry } from "./agent-sdk-types.js";
+import type { AgentSession } from "./agent-sdk-types.js";
 
 export const TRANSCRIPT_TAILER_DEFAULT_POLL_MS = 1000;
 
@@ -11,9 +11,6 @@ export interface TranscriptTailerOptions {
    * are skipped instead of emitted twice. An external turn is an in-flight run
    * too, and must NOT count here — those lines exist only in the transcript. */
   hasDaemonRun: (agentId: string) => boolean;
-  /** Deliver converted entries into the manager's persistence + broadcast
-   * pipeline. Called with whole-line batches, in file order. */
-  emitEntries: (agentId: string, entries: ImportedTimelineEntry[]) => void;
   pollIntervalMs?: number;
 }
 
@@ -33,12 +30,13 @@ interface TailedTranscript {
  * client (e.g. a terminal pane running the provider CLI) keeps executing turns
  * in that external process; the daemon sees no session events for them, and
  * without this the timeline only advances on an explicit reload. The tailer
- * watches the provider-owned transcript, converts appended lines through the
- * same replay pipeline `streamHistory` uses, and hands them to the manager to
- * commit and broadcast — so external turns render live, like daemon-run turns.
+ * watches the provider-owned transcript and hands appended lines back to the
+ * session, which converts them through the same replay pipeline
+ * `streamHistory` uses and emits them to its subscribers — so external turns
+ * reach clients down the path every other turn takes.
  *
  * Providers opt in by implementing `externalTranscriptPath` and
- * `convertExternalTranscriptLines` on their session.
+ * `ingestExternalTranscriptLines` on their session.
  */
 export class TranscriptTailer {
   private readonly tailed = new Map<string, TailedTranscript>();
@@ -57,7 +55,7 @@ export class TranscriptTailer {
    * that do not expose a transcript. */
   arm(agentId: string, session: AgentSession): void {
     const path = session.externalTranscriptPath?.();
-    if (!path || typeof session.convertExternalTranscriptLines !== "function") {
+    if (!path || typeof session.ingestExternalTranscriptLines !== "function") {
       this.disarm(agentId);
       return;
     }
@@ -176,17 +174,11 @@ export class TranscriptTailer {
     }
     state.remainder = Buffer.from(buffered.subarray(lastNewline + 1));
     const content = buffered.subarray(0, lastNewline + 1).toString("utf8");
-    let entries: ImportedTimelineEntry[];
     try {
-      entries = state.session.convertExternalTranscriptLines?.(content) ?? [];
+      state.session.ingestExternalTranscriptLines?.(content);
     } catch (error) {
-      this.logger.warn({ err: error, agentId }, "transcript tail conversion failed");
-      return;
+      this.logger.warn({ err: error, agentId }, "transcript tail ingest failed");
     }
-    if (entries.length === 0) {
-      return;
-    }
-    this.options.emitEntries(agentId, entries);
   }
 }
 
