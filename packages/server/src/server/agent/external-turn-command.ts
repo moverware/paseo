@@ -21,6 +21,14 @@ import { resolvePaseoHome } from "../paseo-home.js";
  */
 export type ExternalCommandKind = "interrupt" | "prompt";
 
+/**
+ * Value of the `origin` label that marks an agent whose turns are run by an
+ * external process. The deployment stamps it when it imports the session, and
+ * it is the only evidence available for a pane that has been idle since the
+ * daemon started and so has reported no turns yet.
+ */
+export const EXTERNAL_ORIGIN_LABEL = "herdr";
+
 const CONFIG_KEY: Record<ExternalCommandKind, string> = {
   interrupt: "externalInterruptCommand",
   prompt: "externalPromptCommand",

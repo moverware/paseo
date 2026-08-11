@@ -713,7 +713,10 @@ export interface AgentSession {
    * (if any) is left untouched, so this is how mid-turn side-effect commands
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
-  tryHandleOutOfBand?(prompt: AgentPromptInput): {
+  tryHandleOutOfBand?(
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): {
     run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
   } | null;
 }

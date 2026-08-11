@@ -125,7 +125,10 @@ import {
   type ProviderCatalog,
   type ResolveAgentDefaultModeInput,
 } from "../../agent-sdk-types.js";
+import { ExternalEchoLedger, promptEchoText } from "../../external-echo-ledger.js";
 import {
+  EXTERNAL_ORIGIN_LABEL,
+  readExternalTurnCommand,
   spawnExternalTurnCommand,
   type ExternalAgentIdentity,
 } from "../../external-turn-command.js";
@@ -2113,6 +2116,8 @@ class ClaudeAgentSession implements AgentSession {
    * labels say which terminal session and pane run this session's turns. */
   private externalAgentId: string | null = null;
   private externalLabels: Record<string, string> = {};
+  /** FORK: prompts routed out to the external process, awaiting their echo. */
+  private readonly externalEchoes = new ExternalEchoLedger();
   /** FORK: an external-turn report has arrived for this session at least once,
    * so its process reports real turn boundaries and tail activity must not be
    * used to infer them. See noteExternalTurn. */
@@ -2281,6 +2286,13 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     this.persistPromptImages(prompt);
+    // FORK: an externally-driven agent's prompt hook may refuse this turn and
+    // hand the prompt to the pane, whose transcript then echoes it back
+    // through the tail. Recorded here because delivery can beat any
+    // result-time signal (measured 2026-08-06).
+    if (this.isExternallyDriven()) {
+      this.externalEchoes.record(promptEchoText(prompt));
+    }
     const sdkMessage = this.toSdkUserMessage(prompt);
     const sdkUserMessageId =
       typeof sdkMessage.uuid === "string" && sdkMessage.uuid.length > 0 ? sdkMessage.uuid : null;
@@ -2407,7 +2419,10 @@ class ClaudeAgentSession implements AgentSession {
       this.ingestPersistedHistoryLine(line, timeline, restoredProviderSubagentIds);
       this.captureExternalRuntimeModel(line);
     }
-    return timeline;
+    return timeline.filter(
+      (entry) =>
+        entry.item.type !== "user_message" || !this.externalEchoes.consume(entry.item.text),
+    );
   }
 
   /**
@@ -2450,6 +2465,61 @@ class ClaudeAgentSession implements AgentSession {
 
   isExternalTurnActive(): boolean {
     return this.autonomousTurn?.external === true;
+  }
+
+  /**
+   * Slash commands for an externally-driven agent are delivered to the
+   * external process instead of run here. Built-in commands like /model
+   * execute inside the daemon's SDK child without firing prompt hooks, so the
+   * hook that routes ordinary prompts never sees them — they would silently
+   * mutate a session nobody is watching while the pane keeps its own model.
+   *
+   * Out-of-band because the delivery must not allocate a turn or cancel one:
+   * external-prompt waits for the pane to go idle before typing.
+   */
+  tryHandleOutOfBand(
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+    if (!this.isExternallyDriven()) {
+      return null;
+    }
+    const text = typeof prompt === "string" ? prompt.trim() : "";
+    if (!text.startsWith("/") || readExternalTurnCommand("prompt") === null) {
+      return null;
+    }
+    // With a clientMessageId the manager commits the user's row itself, and
+    // reconciles the client's optimistic bubble against it; without one
+    // (CLI, MCP, schedules) nothing has recorded the message yet.
+    const shouldEmitUserMessage = !options?.clientMessageId;
+    return {
+      run: async ({ emit }) => {
+        if (shouldEmitUserMessage) {
+          emit({
+            type: "timeline",
+            provider: "claude",
+            item: { type: "user_message", text },
+          });
+        }
+        this.externalEchoes.record(text);
+        spawnExternalTurnCommand({
+          kind: "prompt",
+          identity: this.externalIdentity(),
+          prompt: text,
+          logger: this.logger,
+        });
+      },
+    };
+  }
+
+  /**
+   * True when this agent's turns run in a process the daemon does not own.
+   * Sticky: an external turn report proves it, and so does the label the
+   * deployment stamps at import — which is the only evidence available for an
+   * idle pane that has reported nothing since the daemon started.
+   */
+  private isExternallyDriven(): boolean {
+    return this.externalTurnReportsSeen || this.externalLabels.origin === EXTERNAL_ORIGIN_LABEL;
   }
 
   noteExternalIdentity(identity: { agentId: string; labels: Record<string, string> }): void {

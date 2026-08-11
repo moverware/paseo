@@ -62,7 +62,6 @@ import {
   AgentStreamCoalescer,
 } from "./agent-stream-coalescer.js";
 import { TranscriptTailer } from "./transcript-tailer.js";
-import { readExternalTurnCommand, spawnExternalTurnCommand } from "./external-turn-command.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import { AgentRunState, type ForegroundTurnWaiter } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
@@ -78,10 +77,6 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
-/** How long a delivered prompt may wait for its transcript echo — slash
- * commands flush only with the external process's next turn, which can be
- * arbitrarily later; expired entries just mean one rendered duplicate. */
-const PENDING_ECHO_TTL_MS = 600_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -502,20 +497,6 @@ interface SubscriptionRecord {
 
 const BUSY_STATUSES: Set<AgentLifecycleStatus> = new Set(["initializing", "running"]);
 
-/**
- * Strip the decorations a routed prompt picks up on its way through the
- * external process before echo comparison: inline "[Image #N]" markers (the
- * external CLI renders attached image paths as markers, positioned wherever
- * the blocks land) and the router's trailing "Attached images (read these
- * files): …" appendix. The remaining text is what the user actually typed.
- */
-function normalizeRoutedPromptText(text: string): string {
-  const withoutMarkers = text.replace(/\[Image #\d+\]/g, "");
-  const appendixIndex = withoutMarkers.indexOf("Attached images (read these files):");
-  const body = appendixIndex === -1 ? withoutMarkers : withoutMarkers.slice(0, appendixIndex);
-  return body.trim();
-}
-
 const AgentIdSchema = z.guid();
 
 function isAgentBusy(status: AgentLifecycleStatus): boolean {
@@ -664,13 +645,6 @@ export class AgentManager {
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly transcriptTailer: TranscriptTailer;
-  /**
-   * Prompts handed to an external process whose transcript echo has not been
-   * consumed yet, keyed by agent id (manager-level so reloads don't lose
-   * them). Exact one-shot accounting replaces content-window heuristics: each
-   * delivery eats exactly one matching tailed user message.
-   */
-  private readonly pendingExternalEchoes = new Map<string, Array<{ text: string; ts: number }>>();
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -874,11 +848,6 @@ export class AgentManager {
   private armExternalSession(agent: ActiveManagedAgent): void {
     this.transcriptTailer.arm(agent.id, agent.session);
     agent.session.noteExternalIdentity?.({ agentId: agent.id, labels: agent.labels });
-  }
-
-  /** True when this agent's turns run in a process the daemon does not own. */
-  private isExternallyDriven(agent: ManagedAgent): boolean {
-    return agent.labels.origin === "herdr" || agent.session?.isExternalTurnActive?.() === true;
   }
 
   /**
@@ -1731,10 +1700,7 @@ export class AgentManager {
     // turns on, and the client selector then snaps back to the tailed truth.
     // Deliver /model to the external process instead; its transcript echoes
     // the switch, the tail captures it, and the selector converges on fact.
-    if (
-      normalizedModelId &&
-      (await this.deliverSlashCommandExternally(agentId, `/model ${normalizedModelId}`))
-    ) {
+    if (normalizedModelId && this.tryRunOutOfBand(agentId, `/model ${normalizedModelId}`)) {
       // Optimistic: the transcript records a /model run only with the NEXT
       // turn, so there is no switch-time truth to tail. Tail capture corrects
       // the session state if the delivered switch never executed.
@@ -2063,7 +2029,7 @@ export class AgentManager {
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
     const agent = this.requireSessionAgent(agentId);
-    const handler = agent.session.tryHandleOutOfBand?.(prompt);
+    const handler = agent.session.tryHandleOutOfBand?.(prompt, options);
     if (!handler) {
       return false;
     }
@@ -2128,12 +2094,6 @@ export class AgentManager {
       if (entry.item.type === "user_message" && isSystemInjectedEnvelope(entry.item.text)) {
         continue;
       }
-      if (
-        entry.item.type === "user_message" &&
-        this.consumePendingExternalEcho(agentId, entry.item.text)
-      ) {
-        continue;
-      }
       const row = this.recordTimeline(
         agentId,
         entry.item,
@@ -2162,65 +2122,6 @@ export class AgentManager {
   }
 
   /**
-   * True when a tailed user message is the external process's copy of a
-   * prompt this daemon already committed and then routed away. After a
-   * routed turn the timeline ends with that user row (optionally followed by
-   * a "⤳ …" note), and the tail's first item replays the same text — modulo
-   * appendix lines the router adds, e.g. attached-image paths. Without this
-   * the client shows every routed message twice. Messages typed directly in
-   * the external process never have a committed user row here (they arrive
-   * via the tail alone), so they can't match.
-   */
-  /**
-   * Record a prompt's expected transcript echo BEFORE its run starts. The
-   * route hook delivers to the external process before refusing the daemon
-   * turn, so the echo can reach the tail ahead of any result-time signal
-   * (measured 2026-08-06) — send time is the only unbeatable point. Prompts
-   * that end up running daemon-side never echo (the tailer skips in-flight
-   * runs) and their entries age out by TTL.
-   */
-  recordPendingEchoForExternalAgent(agentId: string, text: string): void {
-    const agent = this.agents.get(agentId);
-    if (!agent) {
-      return;
-    }
-    if (!this.isExternallyDriven(agent)) {
-      return;
-    }
-    this.recordPendingExternalEcho(agentId, text);
-  }
-
-  private recordPendingExternalEcho(agentId: string, text: string): void {
-    const normalized = normalizeRoutedPromptText(text);
-    if (!normalized) {
-      return;
-    }
-    const entries = this.pendingExternalEchoes.get(agentId) ?? [];
-    entries.push({ text: normalized, ts: Date.now() });
-    this.pendingExternalEchoes.set(agentId, entries);
-  }
-
-  /** True when a tailed user message is the echo of a delivered prompt;
-   * consumes the ledger entry so one delivery eats exactly one echo. */
-  private consumePendingExternalEcho(agentId: string, text: string): boolean {
-    const entries = this.pendingExternalEchoes.get(agentId);
-    if (!entries || entries.length === 0) {
-      return false;
-    }
-    const cutoff = Date.now() - PENDING_ECHO_TTL_MS;
-    const live = entries.filter((entry) => entry.ts >= cutoff);
-    const normalized = normalizeRoutedPromptText(text);
-    const index = live.findIndex(
-      (entry) => normalized === entry.text || normalized.startsWith(`${entry.text}\n`),
-    );
-    if (index >= 0) {
-      live.splice(index, 1);
-    }
-    this.pendingExternalEchoes.set(agentId, live);
-    return index >= 0;
-  }
-
-  /**
    * Explicit external-turn report (update_agent_request externalTurn), sent by
    * the external process's own lifecycle hooks: "running" with each prompt and
    * tool call, "idle" the moment the turn ends. Drives the provider session's
@@ -2229,45 +2130,6 @@ export class AgentManager {
    */
   reportExternalTurn(agentId: string, state: "running" | "idle"): void {
     this.agents.get(agentId)?.session.noteExternalTurn?.(state);
-  }
-
-  /**
-   * Hand a slash-command prompt to the external process driving this agent
-   * (daemon.externalPromptCommand). Built-in commands like /model execute
-   * locally in the daemon-side SDK child without firing prompt hooks, so
-   * hook-based routing cannot intercept them and they mutate a session nobody
-   * is watching. Commits the user's message row first, so clients reconcile
-   * their optimistic bubble and the external echo dedupes against it.
-   */
-  async deliverSlashCommandExternally(
-    agentId: string,
-    promptText: string,
-    clientMessageId?: string,
-  ): Promise<boolean> {
-    const agent = this.agents.get(agentId);
-    if (!agent || !this.isExternallyDriven(agent)) {
-      return false;
-    }
-    if (readExternalTurnCommand("prompt") === null) {
-      return false;
-    }
-    await this.appendTimelineItem(agentId, {
-      type: "user_message",
-      text: promptText,
-      ...(clientMessageId ? { clientMessageId } : {}),
-    });
-    this.recordPendingExternalEcho(agentId, promptText);
-    return spawnExternalTurnCommand({
-      kind: "prompt",
-      identity: {
-        agentId: agent.id,
-        sessionId: agent.persistence?.sessionId ?? null,
-        cwd: agent.cwd,
-        labels: agent.labels,
-      },
-      prompt: promptText,
-      logger: this.logger,
-    });
   }
 
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {

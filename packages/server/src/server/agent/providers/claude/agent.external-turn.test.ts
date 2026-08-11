@@ -204,3 +204,136 @@ describe("interrupting an external turn", () => {
     }
   });
 });
+
+describe("out-of-band slash commands for an externally-driven agent", () => {
+  let paseoHome: string | null = null;
+  const originalPaseoHome = process.env.PASEO_HOME;
+
+  afterEach(() => {
+    if (originalPaseoHome === undefined) {
+      delete process.env.PASEO_HOME;
+    } else {
+      process.env.PASEO_HOME = originalPaseoHome;
+    }
+    if (paseoHome) {
+      rmSync(paseoHome, { recursive: true, force: true });
+      paseoHome = null;
+    }
+  });
+
+  function configurePromptCommand(options?: { configured?: boolean }): { evidencePath: string } {
+    paseoHome = mkdtempSync(join(tmpdir(), "external-prompt-"));
+    const evidencePath = join(paseoHome, "delivered.txt");
+    const scriptPath = join(paseoHome, "prompt.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/sh\nprintf '%s' "$PASEO_PROMPT" > ${JSON.stringify(evidencePath)}\n`,
+      {
+        mode: 0o755,
+      },
+    );
+    writeFileSync(
+      join(paseoHome, "config.json"),
+      JSON.stringify(
+        options?.configured === false
+          ? { daemon: {} }
+          : { daemon: { externalPromptCommand: ["/bin/sh", scriptPath] } },
+      ),
+    );
+    process.env.PASEO_HOME = paseoHome;
+    return { evidencePath };
+  }
+
+  function markExternallyDriven(session: AgentSession): void {
+    session.noteExternalIdentity?.({ agentId: "agent-7", labels: { origin: "herdr" } });
+  }
+
+  test("returns no handler for an agent the daemon runs itself", async () => {
+    configurePromptCommand();
+    const { session, close } = await createSession();
+    try {
+      expect(session.tryHandleOutOfBand?.("/model opus")).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  test("returns no handler for an ordinary prompt", async () => {
+    configurePromptCommand();
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      expect(session.tryHandleOutOfBand?.("ship it")).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  test("returns no handler when no delivery command is configured", async () => {
+    configurePromptCommand({ configured: false });
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      expect(session.tryHandleOutOfBand?.("/model opus")).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  test("delivers the command and emits the user's row when nothing else recorded it", async () => {
+    const { evidencePath } = configurePromptCommand();
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      const handler = session.tryHandleOutOfBand?.("/model opus");
+      expect(handler).not.toBeNull();
+
+      const emitted: AgentStreamEvent[] = [];
+      await handler?.run({ emit: (event) => emitted.push(event) });
+
+      expect(emitted).toEqual([
+        {
+          type: "timeline",
+          provider: "claude",
+          item: { type: "user_message", text: "/model opus" },
+        },
+      ]);
+      await vi.waitFor(() => {
+        expect(readFileSync(evidencePath, "utf8")).toBe("/model opus");
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  test("stays silent when the manager already committed the client's message", async () => {
+    const { evidencePath } = configurePromptCommand();
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      const handler = session.tryHandleOutOfBand?.("/compact", { clientMessageId: "msg-1" });
+
+      const emitted: AgentStreamEvent[] = [];
+      await handler?.run({ emit: (event) => emitted.push(event) });
+
+      expect(emitted).toEqual([]);
+      await vi.waitFor(() => {
+        expect(readFileSync(evidencePath, "utf8")).toBe("/compact");
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  test("a reported external turn makes an agent externally driven without the label", async () => {
+    configurePromptCommand();
+    const { session, close } = await createSession();
+    try {
+      session.noteExternalTurn?.("running");
+      session.noteExternalTurn?.("idle");
+      expect(session.tryHandleOutOfBand?.("/model opus")).not.toBeNull();
+    } finally {
+      await close();
+    }
+  });
+});
