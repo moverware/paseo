@@ -6,10 +6,11 @@ export const TRANSCRIPT_TAILER_DEFAULT_POLL_MS = 1000;
 
 export interface TranscriptTailerOptions {
   logger: Logger;
-  /** True while the daemon itself is running a turn for this agent. Its own
+  /** True while the DAEMON itself is running a turn for this agent. Its own
    * stream pump broadcasts those events, so tailed lines written by that run
-   * are skipped instead of emitted twice. */
-  hasInFlightRun: (agentId: string) => boolean;
+   * are skipped instead of emitted twice. An external turn is an in-flight run
+   * too, and must NOT count here — those lines exist only in the transcript. */
+  hasDaemonRun: (agentId: string) => boolean;
   /** Deliver converted entries into the manager's persistence + broadcast
    * pipeline. Called with whole-line batches, in file order. */
   emitEntries: (agentId: string, entries: ImportedTimelineEntry[]) => void;
@@ -142,7 +143,7 @@ export class TranscriptTailer {
     } catch {
       return;
     }
-    if (this.options.hasInFlightRun(agentId)) {
+    if (this.options.hasDaemonRun(agentId)) {
       // The daemon's own run is writing here and broadcasting live.
       state.offset = size;
       state.remainder = Buffer.alloc(0);

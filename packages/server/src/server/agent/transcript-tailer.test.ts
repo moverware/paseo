@@ -39,7 +39,7 @@ describe("TranscriptTailer", () => {
     inFlight = false;
     tailer = new TranscriptTailer({
       logger: pino({ enabled: false }),
-      hasInFlightRun: () => inFlight,
+      hasDaemonRun: () => inFlight,
       emitEntries: (agentId, entries) => {
         emitted.push({ agentId, entries });
       },

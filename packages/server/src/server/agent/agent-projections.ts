@@ -17,7 +17,7 @@ import type {
   AgentUsage,
   ImportableProviderSession,
 } from "./agent-sdk-types.js";
-import { isExternalTurnActive, type ManagedAgent } from "./agent-manager.js";
+import type { ManagedAgent } from "./agent-manager.js";
 import type { JsonValue } from "../json-utils.js";
 import { isStoredAgentProviderAvailable, toAgentPersistenceHandle } from "../persistence-hooks.js";
 export type { ManagedAgent };
@@ -120,10 +120,7 @@ export function toAgentPayload(
     createdAt: agent.createdAt.toISOString(),
     updatedAt: agent.updatedAt.toISOString(),
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
-    // A turn running in an external process reads as running: it is, just not
-    // in this process. Only projected — the stored record keeps the lifecycle,
-    // so a daemon restart never resurrects a stale running status.
-    status: agent.lifecycle === "idle" && isExternalTurnActive(agent) ? "running" : agent.lifecycle,
+    status: agent.lifecycle,
     activeTurn: agent.activeTurnId
       ? {
           turnId: agent.activeTurnId,

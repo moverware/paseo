@@ -621,6 +621,20 @@ export interface AgentPermissionResult {
   followUpPrompt?: AgentPromptInput;
 }
 
+/**
+ * State of a turn executing in a process the daemon does not own (the provider
+ * CLI in a terminal pane).
+ *
+ * - `running` / `idle` — reported by that process's own lifecycle hooks.
+ * - `activity` — inferred from transcript lines. Backstop for a pane whose
+ *   hooks are not wired; ignored once real reports have arrived, because the
+ *   tailer flushes a turn's last lines seconds AFTER the pane reports idle and
+ *   that flush must not reopen the turn (measured 2026-08-03).
+ * - `superseded` — the daemon is taking the turn over, so it ends without the
+ *   external process having finished anything.
+ */
+export type ExternalTurnState = "running" | "activity" | "idle" | "superseded";
+
 export interface AgentSession {
   readonly provider: AgentProvider;
   readonly id: string | null;
@@ -649,6 +663,21 @@ export interface AgentSession {
    * of transcript evidence (which lands only with the next turn).
    */
   noteExternalModelSwitch?(modelId: string): void;
+  /**
+   * Drive this session's autonomous turn on behalf of a process the daemon
+   * does not run. "running" opens one (the manager's normal turn_started
+   * handling then marks the agent running), "idle" completes it, "superseded"
+   * drops it silently because the daemon is about to run the turn itself.
+   * Idempotent: the external process reports "running" repeatedly.
+   */
+  noteExternalTurn?(state: ExternalTurnState): void;
+  /**
+   * True while the open autonomous turn is the external one — as opposed to
+   * the daemon's own child process working between foreground turns. Tells
+   * apart events this daemon already broadcasts from ones only the external
+   * transcript carries.
+   */
+  isExternalTurnActive?(): boolean;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;

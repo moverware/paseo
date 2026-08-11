@@ -114,6 +114,7 @@ import {
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
+  type ExternalTurnState,
   type FetchCatalogOptions,
   type ImportableProviderSession,
   type ImportedTimelineEntry,
@@ -277,6 +278,13 @@ interface EventIdentifiers {
 
 interface AutonomousTurnState {
   id: string;
+  /**
+   * The turn is being executed by an external process (the CLI in a terminal
+   * pane), not by this daemon's child. Everything else about it is a normal
+   * autonomous turn — the flag only says whose output the daemon is already
+   * broadcasting, and where an interrupt has to be sent.
+   */
+  external?: boolean;
 }
 
 interface AsyncMessageInput<T> {
@@ -2097,6 +2105,10 @@ class ClaudeAgentSession implements AgentSession {
   private pendingPermissions = new Map<string, PendingPermission>();
   private activeForegroundTurnId: string | null = null;
   private autonomousTurn: AutonomousTurnState | null = null;
+  /** FORK: an external-turn report has arrived for this session at least once,
+   * so its process reports real turn boundaries and tail activity must not be
+   * used to infer them. See noteExternalTurn. */
+  private externalTurnReportsSeen = false;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly timelineAssembler = new TimelineAssembler();
   private readonly taskProtocolSource = new ClaudeTaskProtocolSource({
@@ -2378,6 +2390,48 @@ class ClaudeAgentSession implements AgentSession {
       this.captureExternalRuntimeModel(line);
     }
     return timeline;
+  }
+
+  /**
+   * Bridge a turn running in an external process onto this session's own
+   * autonomous turn, so the manager's ordinary turn_started/turn_completed
+   * handling marks the agent running and idle. There is no second status
+   * mechanism: the pane's turn is an autonomous turn that happens to execute
+   * somewhere else.
+   */
+  noteExternalTurn(state: ExternalTurnState): void {
+    if (state === "running" || state === "activity") {
+      // Once the external process reports its own turn boundaries, those own
+      // the turn: tailed lines keep arriving for seconds after its idle report
+      // and reopening the turn on them would leave the agent running forever.
+      if (state === "activity" && this.externalTurnReportsSeen) {
+        return;
+      }
+      this.externalTurnReportsSeen ||= state === "running";
+      // A daemon-side foreground turn owns the lifecycle while it runs; the
+      // pane's turn is the one being interrupted in that case, not this one.
+      if (this.activeForegroundTurnId || this.closed) {
+        return;
+      }
+      this.startAutonomousTurn({ external: true });
+      return;
+    }
+    if (!this.autonomousTurn?.external) {
+      return;
+    }
+    if (state === "superseded") {
+      // The daemon is about to run this turn itself. Emitting turn_completed
+      // here would race the foreground turn's own events through the manager's
+      // session queue; drop the turn silently instead.
+      this.autonomousTurn = null;
+      this.syncTurnState("external turn superseded");
+      return;
+    }
+    this.completeAutonomousTurn();
+  }
+
+  isExternalTurnActive(): boolean {
+    return this.autonomousTurn?.external === true;
   }
 
   /**
@@ -3627,12 +3681,20 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
-  private startAutonomousTurn(): void {
+  private startAutonomousTurn(options?: { external?: boolean }): void {
     if (this.autonomousTurn) {
+      // FORK: an unqualified start means this daemon's own child is producing
+      // output for a turn an external report opened. It is ours to broadcast
+      // from here on; leaving it marked external would let the transcript
+      // tailer emit the same lines a second time.
+      if (!options?.external) {
+        this.autonomousTurn.external = false;
+      }
       return;
     }
     this.autonomousTurn = {
       id: this.createTurnId("autonomous"),
+      ...(options?.external ? { external: true } : {}),
     };
     this.activeTurnHasAssistantText = false;
     this.contextUsage.beginTurn();
