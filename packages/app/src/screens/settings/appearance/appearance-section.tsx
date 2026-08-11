@@ -60,6 +60,7 @@ function getThemeLabel(t: TFunction, value: AppSettings["theme"]): string {
     midnight: "settings.appearance.theme.options.midnight",
     claude: "settings.appearance.theme.options.claude",
     ghostty: "settings.appearance.theme.options.ghostty",
+    pureBlack: "settings.appearance.theme.options.pureBlack",
     auto: "settings.appearance.theme.options.auto",
   };
   return t(labelKeys[value]);
@@ -71,6 +72,7 @@ const DARK_VARIANT_THEMES: readonly AppSettings["theme"][] = [
   "midnight",
   "claude",
   "ghostty",
+  "pureBlack",
 ];
 
 // Platform default stacks can be the bare native tokens ("normal"/"monospace");
@@ -208,6 +210,30 @@ function AutoExpandReasoningRow({ value, onChange }: AutoExpandReasoningRowProps
         </Text>
       </View>
       <Switch value={value} onValueChange={onChange} />
+    </View>
+  );
+}
+
+interface ChatOutlineRowProps {
+  value: boolean;
+  onChange: (value: boolean) => void;
+}
+
+function ChatOutlineRow({ value, onChange }: ChatOutlineRowProps) {
+  const { t } = useTranslation();
+  return (
+    <View style={[settingsStyles.row, settingsStyles.rowBorder]}>
+      <View style={settingsStyles.rowContent}>
+        <Text style={settingsStyles.rowTitle}>{t("settings.appearance.chatOutline.title")}</Text>
+        <Text style={settingsStyles.rowHint}>
+          {t("settings.appearance.chatOutline.description")}
+        </Text>
+      </View>
+      <Switch
+        value={value}
+        onValueChange={onChange}
+        accessibilityLabel={t("settings.appearance.chatOutline.title")}
+      />
     </View>
   );
 }
@@ -503,6 +529,13 @@ export function AppearanceSection() {
     [updateSettings],
   );
 
+  const handleChatOutlineChange = useCallback(
+    (chatOutlineEnabled: boolean) => {
+      void updateSettings({ chatOutlineEnabled });
+    },
+    [updateSettings],
+  );
+
   const commitUiFontFamily = useCallback(
     (value: string) => {
       const sanitized = sanitizeFontFamily(value);
@@ -593,6 +626,12 @@ export function AppearanceSection() {
             value={settings.toolCallDetailLevel}
             onChange={handleToolCallDetailLevelChange}
           />
+          {!isNative ? (
+            <ChatOutlineRow
+              value={settings.chatOutlineEnabled}
+              onChange={handleChatOutlineChange}
+            />
+          ) : null}
         </View>
       </SettingsSection>
       <SettingsSection title={t("settings.appearance.fonts.title")}>

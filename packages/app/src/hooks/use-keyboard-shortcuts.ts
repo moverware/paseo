@@ -3,7 +3,7 @@ import { usePathname, useRouter } from "expo-router";
 import { getIsElectronRuntime } from "@/constants/layout";
 import { useKeyboardShortcutsStore } from "@/stores/keyboard-shortcuts-store";
 import { setCommandCenterFocusRestoreElement } from "@/utils/command-center-focus-restore";
-import { getResidentBrowserWebview } from "@/components/browser-webview-resident";
+import { getResidentBrowserWebview } from "@/desktop/browser/resident-webviews";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { keyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatcher";
 import {
@@ -18,7 +18,7 @@ import {
   buildBrowserKeyboardPolicy,
   parseBrowserShortcutInput,
   shouldPublishBrowserShortcutPolicy,
-} from "@/keyboard/browser-shortcuts";
+} from "@/desktop/browser/shortcuts";
 import type { KeyboardFocusScope, KeyboardShortcutPayload } from "@/keyboard/actions";
 import {
   routeKeyboardShortcut,
@@ -29,6 +29,7 @@ import { getShortcutOs } from "@/utils/shortcut-platform";
 import { useOpenAddProject } from "@/hooks/use-open-add-project";
 import { useKeyboardShortcutOverrides } from "@/hooks/use-keyboard-shortcut-overrides";
 import { isNative } from "@/constants/platform";
+import { keyboardShortcutsAvailable } from "@/keyboard/availability";
 import { getDesktopHost, isElectronRuntime } from "@/desktop/host";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import {
@@ -40,14 +41,18 @@ import {
 export function useKeyboardShortcuts({
   enabled,
   isMobile,
+  isWorkspaceFocusModeEnabled,
   toggleAgentList,
   toggleBothSidebars,
+  exitFocusMode,
   cycleTheme,
 }: {
   enabled: boolean;
   isMobile: boolean;
+  isWorkspaceFocusModeEnabled: boolean;
   toggleAgentList: () => void;
   toggleBothSidebars?: () => void;
+  exitFocusMode: () => void;
   cycleTheme?: () => void;
 }) {
   const pathname = usePathname();
@@ -55,6 +60,7 @@ export function useKeyboardShortcuts({
   const resetModifiers = useKeyboardShortcutsStore((s) => s.resetModifiers);
   const { overrides } = useKeyboardShortcutOverrides();
   const bindings = useMemo(() => buildEffectiveBindings(overrides), [overrides]);
+  const shortcutsAvailable = keyboardShortcutsAvailable({ isNative, isCompact: isMobile });
   const isDesktopApp = getIsElectronRuntime();
   const isMac = getShortcutOs() === "mac";
   const chordStateRef = useRef<ChordState>({
@@ -65,11 +71,12 @@ export function useKeyboardShortcuts({
   const openProjectPickerAction = useOpenAddProject();
   const activeWorkspaceSelection = useActiveWorkspaceSelection();
   const keyboardWorkspaceSelectionRef = useRef<ActiveWorkspaceSelection | null>(null);
+  const badgeModifierKeyRef = useRef<string | null | undefined>(undefined);
 
   const publishBrowserShortcutPolicy = useCallback(
     (chordState?: ChordState) => {
       const policy =
-        enabled && !isMobile
+        enabled && shortcutsAvailable
           ? buildBrowserKeyboardPolicy({
               bindings,
               chordState,
@@ -79,7 +86,7 @@ export function useKeyboardShortcuts({
           : { menuPrefixes: [], prefixes: [] };
       void getDesktopHost()?.browser?.setShortcutPolicy?.(policy);
     },
-    [bindings, enabled, isDesktopApp, isMac, isMobile],
+    [bindings, enabled, isDesktopApp, isMac, shortcutsAvailable],
   );
 
   useEffect(() => {
@@ -98,14 +105,19 @@ export function useKeyboardShortcuts({
 
   useEffect(() => {
     if (!enabled) return;
-    if (isNative) return;
-    if (isMobile) return;
+    if (!shortcutsAvailable) return;
 
     // Only the modifier that actually performs the workspace-index jump on this
     // runtime should reveal the sidebar number badges (Alt on web, Cmd on
     // desktop Mac, Ctrl on desktop non-Mac). The store ORs altDown/cmdOrCtrlDown
     // to drive badge visibility, so we set the flag matching this runtime.
-    const badgeModifierKey = getWorkspaceIndexJumpModifierKey({ isMac, isDesktop: isDesktopApp });
+    // Derived from the effective bindings: `null` when the user unassigned or
+    // rebound the jump shortcut, and no `event.key` ever equals null, so the
+    // badges simply never appear.
+    const badgeModifierKey = getWorkspaceIndexJumpModifierKey(
+      { isMac, isDesktop: isDesktopApp },
+      bindings,
+    );
     const setBadgeModifierDown = (down: boolean) => {
       const state = useKeyboardShortcutsStore.getState();
       if (isDesktopApp) {
@@ -114,6 +126,16 @@ export function useKeyboardShortcuts({
         state.setAltDown(down);
       }
     };
+
+    // The keyup listener matches the released key against the modifier derived
+    // when the effect last ran, so a modifier held while the jump binding
+    // changes can never be released -- the badges would stay up until a blur.
+    // Clear on change only: this effect also re-runs on every navigation, and
+    // clearing unconditionally would drop the badges mid Cmd+1, Cmd+2.
+    if (badgeModifierKeyRef.current !== badgeModifierKey) {
+      badgeModifierKeyRef.current = badgeModifierKey;
+      resetModifiers();
+    }
 
     const shouldHandle = () => {
       if (typeof document === "undefined") return false;
@@ -207,11 +229,15 @@ export function useKeyboardShortcuts({
           shortcutsDialogOpen: store.shortcutsDialogOpen,
         },
       );
-      return performShortcutAction(
+      const handled = performShortcutAction(
         shortcutAction,
         input.domEvent,
         input.browserFocusRestoreElement,
       );
+      if (handled && isWorkspaceFocusModeEnabled && input.action.startsWith("sidebar.")) {
+        exitFocusMode();
+      }
+      return handled;
     };
 
     const resolveAndPerformShortcut = (input: {
@@ -371,15 +397,18 @@ export function useKeyboardShortcuts({
     bindings,
     cycleTheme,
     enabled,
+    exitFocusMode,
     activeWorkspaceSelection,
     isDesktopApp,
     isMac,
     isMobile,
+    isWorkspaceFocusModeEnabled,
     openProjectPickerAction,
     pathname,
     publishBrowserShortcutPolicy,
     resetModifiers,
     router,
+    shortcutsAvailable,
     toggleAgentList,
     toggleBothSidebars,
   ]);

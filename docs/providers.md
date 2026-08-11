@@ -2,6 +2,41 @@
 
 This guide walks through adding a new agent provider end-to-end. There are two integration patterns, and this doc covers both.
 
+## Provider-native session options
+
+`AgentSessionConfig.providerOptions` carries JSON-safe configuration for the selected provider. The
+names and nesting are the provider's native contract; options are not portable between providers.
+Paseo validates the object with the selected provider's strict schema before constructing a session.
+Unknown keys fail with their `providerOptions.*` path. Paseo-owned controls such as cwd, model,
+prompt, environment, session identity, MCP transport, callbacks, and hooks cannot be passed here.
+
+This Paseo version accepts these keys:
+
+- **Codex:** `approval_policy`, `sandbox_mode`,
+  `sandbox_workspace_write.{writable_roots,network_access,exclude_slash_tmp,exclude_tmpdir_env_var}`,
+  `web_search`, `features.multi_agent_v2`, and `features.network_proxy`. A network proxy object may
+  contain `enabled`, `proxy_url`, `socks_url`, `enable_socks5`, `enable_socks5_udp`,
+  `allow_local_binding`, `allow_upstream_proxy`, `dangerously_allow_all_unix_sockets`,
+  `dangerously_allow_non_loopback_proxy`, `domains`, and `unix_sockets`. See the
+  [Codex configuration reference](https://developers.openai.com/codex/config-reference).
+- **Claude:** `allowedTools`, `disallowedTools`, `additionalDirectories`, `sandbox`, and `settings`.
+  The accepted sandbox fields cover enablement, fail-if-unavailable behavior, excluded and
+  unsandboxed commands, filesystem read/write rules, network domain/socket/local-binding rules,
+  weaker nested sandboxing, ignored violations, and the ripgrep command. `settings` accepts native
+  `permissions.{allow,ask,deny}` and sandbox settings. See the
+  [Claude Agent SDK TypeScript reference](https://platform.claude.com/docs/en/agent-sdk/typescript)
+  and [Claude settings reference](https://code.claude.com/docs/en/settings).
+- **OpenCode:** `permission`, either one `ask`/`allow`/`deny` action or the native per-tool rule
+  object. Supported entries are `read`, `edit`, `glob`, `grep`, `list`, `bash`, `task`,
+  `external_directory`, `todowrite`, `question`, `webfetch`, `websearch`, `codesearch`,
+  `repo_clone`, `repo_overview`, `lsp`, `doom_loop`, and `skill`. See the
+  [OpenCode permissions reference](https://opencode.ai/docs/permissions/). OpenCode permissions are
+  application policy, not an OS sandbox.
+
+Each provider definition owns its option schema and exact MCP preapproval mapping. A new provider
+must fail closed for Hub unattended execution until it can approve one exact injected MCP server
+and tool identity without approving native tools.
+
 ## Two Integration Patterns
 
 ### ACP (Agent Client Protocol) -- recommended
@@ -11,6 +46,8 @@ Extend `ACPAgentClient` from `packages/server/src/server/agent/providers/acp-age
 The only built-in ACP provider today is `copilot` (`copilot-acp-agent.ts`). `GenericACPAgentClient` (`generic-acp-agent.ts`) is also ACP-based but is used for user-defined custom providers configured via `extends: "acp"` overrides — see [docs/custom-providers.md](custom-providers.md).
 
 Copilot custom agents are exposed through ACP session config, not the slash-command list. When custom agents are available, Copilot returns a select config option with `id: "agent"` and `category: "_agent"`; Paseo maps that to the `agent` provider feature. Copilot uses the agent display name as the option value, and the blank value means the default Copilot agent.
+
+ACP permission options are rendered as ordered actions and Paseo returns the selected option's exact `optionId`. Agents can therefore encode a single-choice question as multiple options of the same allow kind. Auto-accept does not resolve those chooser requests; they always wait for the user.
 
 ### Direct
 
@@ -42,11 +79,13 @@ OpenCode MCP injection is dynamic and session-scoped. Call OpenCode's `mcp.add` 
 
 OpenCode owns user message IDs. Do not pass Paseo-generated IDs to OpenCode prompt APIs; let OpenCode create `msg*` IDs and record the user timeline item from the `message.updated` event.
 
-Every provider adapter owns its canonical user-message timeline rows. When a foreground prompt is accepted, the adapter must emit exactly one `user_message` timeline item for that submitted prompt, using the same message ID it gives to or receives from the provider runtime. Optimistic client messages are UI-only and provider transcript echoes are optional; neither is allowed to be the only source of truth. If the provider later echoes the same submitted user message, dedupe it only within the active turn. Prefer provider-visible message IDs, but ACP runtimes may omit that ID or replace it with a provider-owned one; in that case suppress only echo chunks whose accumulated text is a prefix of the active submitted prompt. Do not perform global transcript text dedupe.
+`AgentManager` owns the one canonical timeline row for a foreground prompt carrying a Paseo `clientMessageId`. It records that row when `startTurn` accepts, with the wire `messageId` set to the same value. Provider adapters still emit their native user-message echo with the same `clientMessageId` when available; the manager records its provider identity on the internal row without changing or redispatching the wire item. If an adapter emits the echo before `startTurn` resolves, the manager records the provider identity with the row at acceptance. Provider adapters continue to own externally initiated user rows that have no Paseo client identity. Do not perform global transcript text dedupe.
 
-Submitted user-message rows preserve both identities: `messageId` is the provider-visible ID and the optional `clientMessageId` is the Paseo ID from `AgentRunOptions`. Attach `clientMessageId` only to the canonical row for that foreground submission; provider history and externally initiated user rows do not have a Paseo client ID.
+Rewind accepts the canonical wire `messageId` and resolves it to the provider identity before calling the adapter. A submitted prompt cannot be rewound until its provider echo supplies that identity.
 
-Draft metadata lookups should avoid creating provider sessions when the upstream provider has top-level APIs for that metadata. Prefer `AgentClient.fetchCatalog`, `listCommands`, or `listFeatures` over creating a scratch `AgentSession`; scratch sessions can show up as empty native sessions in provider import/history UIs. `fetchCatalog` is the single discovery API for models and modes — provider implementations may use one process, separate upstream calls, or static data internally, but callers outside the provider do not get separate runtime model/mode probes. Draft feature and command listing must use the explicit draft model only; if no model is selected yet, return no metadata instead of resolving a default model through catalog discovery.
+Submitted user-message wire items carry the same Paseo ID in `messageId` and `clientMessageId`. Provider adapters attach `clientMessageId` only to the echo for that foreground submission; provider history and externally initiated user rows do not have a Paseo client ID.
+
+Draft metadata lookups should avoid creating provider sessions when the upstream provider has top-level APIs for that metadata. Prefer `AgentClient.fetchCatalog`, `listCommands`, or `listFeatures` over creating a scratch `AgentSession`; scratch sessions can show up as empty native sessions in provider import/history UIs. `fetchCatalog` is the single discovery API for models and modes — provider implementations may use one process, separate upstream calls, or static data internally, but callers outside the provider do not get separate runtime model/mode probes. Draft command listing and scratch-session feature listing require an explicit draft model. Do not resolve a default model through catalog discovery. A client-level `listFeatures` implementation may return features from an incomplete, model-less draft and owns which features are valid in that state.
 
 Provider session import has its own contract. The picker calls `listImportableSessions` and receives rows only: provider handle, cwd, title, prompt previews, and last activity. Import calls `importSession({ providerHandleId, cwd })` for the selected row and must not call listing again. The provider returns the resumed session, storage config, persistence handle, and hydrated timeline for that one native session; `AgentManager.importProviderSession` seeds the daemon timeline and publishes the Paseo agent only after it is ready.
 
@@ -65,6 +104,8 @@ Daemon bootstrap reconciles that ledger in the background, without blocking star
 The daemon keeps provider snapshots per resolved working directory, with a separate semantic global scope for settings/provider management and requests that do not carry a cwd. Provider catalog probes receive a discriminated `FetchCatalogOptions`: `{ scope: "global", force }` for global catalog refreshes, or `{ scope: "workspace", cwd, force }` for project-scoped refreshes. Providers decide what global means for their runtime; do not infer global by comparing a cwd to the user's home directory.
 
 Snapshot reads may probe providers only while the requested cwd scope is cold. Once an entry is warm, its `ready`, `error`, or `unavailable` state stays cached until an explicit refresh. Do not add TTL revalidation, focus-triggered refreshes, selector-open refreshes, or config-reload refreshes. Selector-open refetches may read an already-loading or stale React Query, but they must not force provider probing on their own.
+
+Capable clients receive a compact, content-addressed snapshot. Model rows derive their provider from the containing entry and reference snapshot-level thinking sets. The app persists that compact shape per server and cwd, then sends its hash on the next pull; an unchanged response carries no catalog body. Keep the legacy encoding for clients without the capability. The hash covers the complete client-visible compact snapshot, including status and `fetchedAt`, so explicit refreshes invalidate it even when the discovered catalog is otherwise equal.
 
 Settings refresh is the user-facing "forget stale provider knowledge everywhere" action. A settings refresh clears provider snapshot caches and in-flight loads across all cwd scopes, then immediately refreshes only the global snapshot with `force: true`. Workspace snapshots are re-probed lazily on the next scoped read; do not fan out a settings refresh across every known workspace.
 

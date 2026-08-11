@@ -79,9 +79,11 @@ export const en = {
       desktop: "Message the agent, tag @files, or use /commands and /skills",
       mobile: "Message, @files, /commands",
       fallback: "Message...",
+      terminal: "Prompt",
     },
     input: {
       accessibilityLabel: "Message agent...",
+      terminalAccessibilityLabel: "Terminal prompt",
       focusHint: "{{shortcut}} to focus",
       addAttachment: "Add attachment",
       interruptAgent: "Interrupt agent",
@@ -110,6 +112,7 @@ export const en = {
     },
     attachments: {
       addImage: "Add image",
+      pasteImage: "Paste image",
       addFile: "Upload file",
       addIssueOrPr: "Add issue or PR",
       addIssueOrPr_mr: "Add issue or MR",
@@ -135,6 +138,8 @@ export const en = {
       initialPromptRequired: "Initial prompt is required",
       alreadyLoading: "Already loading",
       uploadFailed: "Failed to upload file",
+      noClipboardImage: "No image in clipboard",
+      pasteImageFailed: "Failed to paste image",
       fileTooLarge: "{{fileName}} is too large (max {{size}})",
     },
     clientCommands: {
@@ -185,6 +190,7 @@ export const en = {
   agentStream: {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
+    historyLoadFailed: "Couldn't load agent history",
     permission: {
       plan: "Plan",
       required: "Permission Required",
@@ -199,7 +205,7 @@ export const en = {
     states: {
       notFound: "Agent not found",
       failedToLoad: "Failed to load agent",
-      reconnecting: "Reconnecting...",
+      reconnecting: "Reconnecting",
       timelineSyncFailed: "Couldn't refresh agent history. Retrying…",
       archivingTitle: "Archiving agent...",
       archivingSubtitle: "Please wait while we archive this agent.",
@@ -224,8 +230,13 @@ export const en = {
   sessions: {
     title: "History",
     empty: "No sessions yet",
+    noMatches: "No sessions match",
+    tooManyMatches: "Too many matches — narrow your search",
+    hostLoadFailed: "{{host}}: Could not load history",
+    searchPlaceholder: "Search history",
     actions: {
       loadMore: "Load more",
+      clearSearch: "Clear search",
     },
   },
   agentList: {
@@ -261,7 +272,7 @@ export const en = {
       copyCode: "Copy code",
       copyTurn: "Copy turn",
       copyMessage: "Copy message",
-      forkMenu: "Fork chat",
+      forkMenu: "Fork chat from here",
       forkInNewTab: "Fork in a new tab",
       forkInNewWorkspace: "Fork in a new workspace",
       forkUnavailable: "Update the host to use this.",
@@ -379,7 +390,7 @@ export const en = {
       openFile: "Open file",
       copyPath: "Copy path",
       download: "Download",
-      addToChat: "Add to chat…",
+      addToChat: "Add to chat",
       moreActions: "More actions",
     },
     fileExplorer: {
@@ -476,6 +487,7 @@ export const en = {
     },
     terminal: {
       hostDisconnected: "Host is not connected",
+      updateHost: "Update the host to use the native terminal renderer.",
       unableToSubscribe: "Unable to subscribe to terminal",
     },
     tabs: {
@@ -840,6 +852,14 @@ export const en = {
           viewPullRequest: "View",
           openOn: "Open on {{brand}}",
         },
+        checksSummary: {
+          passedLabel: "passed",
+          failedLabel: "failed",
+          runningLabel: "running",
+          passedAccessible: "Checks passed",
+          failedAccessible: "Checks failed",
+          runningAccessible: "Checks running",
+        },
         sections: {
           checks: "Checks",
           pipeline: "Pipeline",
@@ -887,6 +907,38 @@ export const en = {
     },
   },
   sidebar: {
+    display: {
+      trigger: "Display preferences",
+      heading: "Display",
+      grouping: {
+        label: "Grouping",
+        project: "Project",
+        status: "Status",
+      },
+      titleSource: {
+        label: "Title",
+        title: "Title",
+        branch: "Branch name",
+      },
+      show: {
+        label: "Show",
+        host: "Host",
+        changeRequest: "Pull request",
+        checks: "Checks",
+        services: "Services",
+        diff: "Diff stats",
+        timestamp: "Last activity",
+      },
+      checks: {
+        iconAndText: "Icon and text",
+        icon: "Icon only",
+        none: "Hidden",
+      },
+      hostFilter: {
+        label: "Host",
+        all: "All hosts",
+      },
+    },
     pinned: {
       title: "Pinned",
     },
@@ -912,7 +964,7 @@ export const en = {
       discord: "Discord",
       github: "Create GitHub issue",
       whatsNew: "What's new",
-      version: "Paseo {{version}}",
+      appName: "Paseo",
     },
     sections: {
       sessions: "History",
@@ -954,7 +1006,8 @@ export const en = {
     },
     workspace: {
       status: {
-        scriptsAvailable: "Scripts available",
+        serviceRunning: "Service {{name}} running",
+        serviceUnhealthy: "Service {{name}} unhealthy",
         creating: "Creating...",
       },
       actions: {
@@ -1016,14 +1069,29 @@ export const en = {
       composerStateRequired: "Composer state is required",
       selectModel: "Select a model",
     },
+    tooltips: {
+      project: "Choose the project",
+      host: "Choose the host",
+      isolation: "Choose the isolation level",
+      startingRef: "Choose where to start from",
+      launch: "Choose what to launch",
+    },
     refPicker: {
       startingRef: "Starting ref",
-      chooseStart: "Choose where to start from",
       intoBase: "into {{baseRef}}",
       searching: "Searching...",
       noMatchingRefs: "No matching refs.",
       searchPlaceholder: "Search branches and PRs",
       title: "Start from",
+    },
+    launch: {
+      title: "What to launch",
+      chat: "Chat",
+      terminal: "Terminal",
+      manageProfiles: "Manage profiles",
+      submit: "Launch",
+      promptPlaceholder: "Prompt {{name}}",
+      commandPlaceholder: "Run a command, or leave empty for a blank terminal",
     },
   },
   desktop: {
@@ -1185,7 +1253,6 @@ export const en = {
     },
   },
   rootError: {
-    kicker: "Something went wrong",
     title: "Paseo ran into a problem.",
     body: "Try again to reload the app. If this keeps happening, include the details below when you report it.",
     details: "Details",
@@ -1634,6 +1701,7 @@ export const en = {
       editor: "Editor",
       shortcuts: "Shortcuts",
       integrations: "Integrations",
+      notifications: "Notifications",
       permissions: "Permissions",
       diagnostics: "Diagnostics",
       about: "About",
@@ -1642,6 +1710,21 @@ export const en = {
       title: "Editor",
       vimKeybindings: "Vim keybindings",
       vimHint: "Applies to source files on web and desktop.",
+    },
+    notifications: {
+      title: "Notifications",
+      permission: "Notification permission",
+      refreshAccessibility: "Refresh notification permission",
+      playSound: "Play sound",
+      playSoundHint: "Play a sound when a desktop notification arrives",
+      test: "Test notification",
+      testHint: "Send a notification using these settings",
+      permissionRequired: "Allow notification access before testing",
+      send: "Send",
+      sending: "Sending...",
+      sentTitle: "Test notification sent",
+      sentDescription: "Paseo handed the notification to the operating system.",
+      sendFailedTitle: "Unable to send test notification",
     },
     hostSections: {
       projects: "Projects",
@@ -1714,6 +1797,7 @@ export const en = {
           es: "Spanish",
           fr: "French",
           ja: "Japanese",
+          ko: "Korean",
           ptBR: "Brazilian Portuguese",
           ru: "Russian",
           zhCN: "Simplified Chinese",
@@ -1722,6 +1806,11 @@ export const en = {
     },
     diagnostics: {
       title: "Diagnostics",
+      legacyTerminalRenderer: {
+        label: "Use legacy terminal renderer",
+        description: "Use the previous WebView terminal after reopening a terminal",
+        accessibilityLabel: "Use legacy terminal renderer",
+      },
       testAudio: "Test audio",
       playTest: "Play test",
       playing: "Playing...",
@@ -1782,11 +1871,16 @@ export const en = {
           midnight: "Midnight",
           claude: "Claude",
           ghostty: "Ghostty",
+          pureBlack: "Pure black",
           auto: "System",
         },
       },
       detailLevel: {
         title: "Detail level",
+      },
+      chatOutline: {
+        title: "Chat outline",
+        description: "Show an outline for jumping between prompts",
       },
       fonts: {
         title: "Fonts",
@@ -1816,11 +1910,15 @@ export const en = {
       searchPlaceholder: "Search shortcuts",
       unavailableOnMobile: "Keyboard shortcuts are only available on desktop",
       capturePrompt: "Press shortcut...",
+      unassigned: "Not set",
       actions: {
+        menu: "Actions for {{name}}",
         done: "Done",
         cancel: "Cancel",
+        bind: "Bind",
         rebind: "Rebind",
-        reset: "Reset",
+        clear: "Clear",
+        reset: "Reset to default",
         resetAll: "Reset all",
       },
       sections: {
@@ -1927,20 +2025,52 @@ export const en = {
     },
     permissions: {
       title: "Permissions",
-      notifications: "Notifications",
       microphone: "Microphone",
       refresh: "Refresh",
       refreshing: "Refreshing...",
       refreshAccessibility: "Refresh desktop permissions",
-      test: "Test",
       actions: {
         granted: "Granted",
         request: "Request",
         requesting: "Requesting...",
-        busySuffix: "{{label}}...",
       },
     },
     host: {
+      appearance: {
+        title: "Appearance",
+        name: {
+          label: "Name",
+        },
+        color: {
+          label: "Color",
+          accessibilityLabel: "Color, {{value}}",
+          options: {
+            none: "Default",
+            violet: "Violet",
+            sky: "Sky",
+            emerald: "Emerald",
+            orange: "Orange",
+            pink: "Pink",
+            indigo: "Indigo",
+            teal: "Teal",
+            red: "Red",
+            amber: "Amber",
+            blue: "Blue",
+          },
+        },
+        badge: {
+          label: "Sidebar badge",
+          accessibilityLabel: "Sidebar badge, {{value}}",
+          options: {
+            name: "Name",
+            icon: "Icon only",
+            hidden: "Hidden",
+          },
+        },
+        preview: {
+          workspaceName: "my-workspace",
+        },
+      },
       notFound: "Host not found",
       badges: {
         relay: "Relay",

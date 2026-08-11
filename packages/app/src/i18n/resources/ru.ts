@@ -81,9 +81,11 @@ export const ru: TranslationResources = {
       desktop: "Напишите агенту сообщение, отметьте @files или используйте /commands и /skills.",
       mobile: "Сообщение,@files,/commands",
       fallback: "Сообщение...",
+      terminal: "Prompt",
     },
     input: {
       accessibilityLabel: "Агент сообщений...",
+      terminalAccessibilityLabel: "Terminal prompt",
       focusHint: "{{shortcut}}, чтобы сосредоточиться",
       addAttachment: "Добавить вложение",
       interruptAgent: "Агент прерываний",
@@ -112,6 +114,7 @@ export const ru: TranslationResources = {
     },
     attachments: {
       addImage: "Добавить изображение",
+      pasteImage: "Вставить изображение",
       addFile: "Upload file",
       addIssueOrPr: "Добавить проблему или PR",
       addIssueOrPr_mr: "Добавить проблему или MR",
@@ -137,6 +140,8 @@ export const ru: TranslationResources = {
       initialPromptRequired: "Требуется начальное приглашение",
       alreadyLoading: "Уже загружается",
       uploadFailed: "Failed to upload file",
+      noClipboardImage: "В буфере обмена нет изображения",
+      pasteImageFailed: "Не удалось вставить изображение",
       fileTooLarge: "{{fileName}} is too large (max {{size}})",
     },
     clientCommands: {
@@ -187,6 +192,7 @@ export const ru: TranslationResources = {
   agentStream: {
     empty: "Начните общаться с этим агентом...",
     scrollToBottom: "Прокрутить вниз",
+    historyLoadFailed: "Не удалось загрузить историю агента",
     permission: {
       plan: "План",
       required: "Требуется разрешение",
@@ -201,7 +207,7 @@ export const ru: TranslationResources = {
     states: {
       notFound: "Agent не найден",
       failedToLoad: "Не удалось загрузить агент",
-      reconnecting: "Повторное подключение...",
+      reconnecting: "Повторное подключение",
       timelineSyncFailed: "Не удалось обновить историю агента. Повторная попытка…",
       archivingTitle: "Архивный агент...",
       archivingSubtitle: "Пожалуйста, подождите, пока мы архивируем этого агента.",
@@ -227,8 +233,13 @@ export const ru: TranslationResources = {
   sessions: {
     title: "История",
     empty: "Сеансов пока нет",
+    noMatches: "Нет подходящих сеансов",
+    tooManyMatches: "Слишком много совпадений — уточните запрос",
+    hostLoadFailed: "{{host}}: Не удалось загрузить историю",
+    searchPlaceholder: "Поиск по истории",
     actions: {
       loadMore: "Загрузить больше",
+      clearSearch: "Очистить поиск",
     },
   },
   agentList: {
@@ -383,7 +394,7 @@ export const ru: TranslationResources = {
       openFile: "Открыть файл",
       copyPath: "Копировать путь",
       download: "Скачать",
-      addToChat: "Добавить в чат…",
+      addToChat: "Добавить в чат",
       moreActions: "Дополнительные действия",
     },
     fileExplorer: {
@@ -481,6 +492,7 @@ export const ru: TranslationResources = {
     },
     terminal: {
       hostDisconnected: "Host не подключен",
+      updateHost: "Обновите хост, чтобы использовать нативный терминал.",
       unableToSubscribe: "Невозможно подписаться на терминал",
     },
     tabs: {
@@ -852,6 +864,14 @@ export const ru: TranslationResources = {
           viewPullRequest: "Открыть",
           openOn: "Открыть на {{brand}}",
         },
+        checksSummary: {
+          passedLabel: "успешно",
+          failedLabel: "ошибка",
+          runningLabel: "выполняется",
+          passedAccessible: "Проверки пройдены",
+          failedAccessible: "Проверки не пройдены",
+          runningAccessible: "Проверки выполняются",
+        },
         sections: {
           checks: "Чеки",
           pipeline: "Пайплайн",
@@ -899,6 +919,38 @@ export const ru: TranslationResources = {
     },
   },
   sidebar: {
+    display: {
+      trigger: "Настройки отображения",
+      heading: "Отображение",
+      grouping: {
+        label: "Группировка",
+        project: "Проект",
+        status: "Статус",
+      },
+      titleSource: {
+        label: "Заголовок",
+        title: "Заголовок",
+        branch: "Имя ветки",
+      },
+      show: {
+        label: "Показывать",
+        host: "Хост",
+        changeRequest: "Pull request",
+        checks: "Проверки",
+        services: "Сервисы",
+        diff: "Статистика изменений",
+        timestamp: "Последняя активность",
+      },
+      checks: {
+        iconAndText: "Значок и текст",
+        icon: "Только значок",
+        none: "Скрыто",
+      },
+      hostFilter: {
+        label: "Хост",
+        all: "Все хосты",
+      },
+    },
     pinned: {
       title: "Закреплённые",
     },
@@ -924,7 +976,7 @@ export const ru: TranslationResources = {
       discord: "Discord",
       github: "Создать issue в GitHub",
       whatsNew: "Что нового",
-      version: "Paseo {{version}}",
+      appName: "Paseo",
     },
     sections: {
       sessions: "История",
@@ -966,7 +1018,8 @@ export const ru: TranslationResources = {
     },
     workspace: {
       status: {
-        scriptsAvailable: "Доступны скрипты",
+        serviceRunning: "Сервис {{name}} запущен",
+        serviceUnhealthy: "Сервис {{name}} неисправен",
         creating: "Создание...",
       },
       actions: {
@@ -1028,14 +1081,29 @@ export const ru: TranslationResources = {
       composerStateRequired: "Требуется состояние композитора.",
       selectModel: "Выберите модель",
     },
+    tooltips: {
+      project: "Choose the project",
+      host: "Choose the host",
+      isolation: "Choose the isolation level",
+      startingRef: "Выберите, с чего начать",
+      launch: "Choose what to launch",
+    },
     refPicker: {
       startingRef: "Начальная ссылка",
-      chooseStart: "Выберите, с чего начать",
       intoBase: "в {{baseRef}}",
       searching: "Идет поиск...",
       noMatchingRefs: "Нет подходящих ссылок.",
       searchPlaceholder: "Поиск филиалов и PR",
       title: "Начать с",
+    },
+    launch: {
+      title: "What to launch",
+      chat: "Chat",
+      terminal: "Terminal",
+      manageProfiles: "Manage profiles",
+      submit: "Launch",
+      promptPlaceholder: "Prompt {{name}}",
+      commandPlaceholder: "Run a command, or leave empty for a blank terminal",
     },
   },
   desktop: {
@@ -1204,7 +1272,6 @@ export const ru: TranslationResources = {
     },
   },
   rootError: {
-    kicker: "Что-то пошло не так",
     title: "В Paseo возникла проблема.",
     body: "Попробуйте снова перезагрузить приложение. Если это повторяется, приложите приведенные ниже подробности к отчету.",
     details: "Подробности",
@@ -1657,6 +1724,7 @@ export const ru: TranslationResources = {
       editor: "Редактор",
       shortcuts: "Ярлыки",
       integrations: "Интеграции",
+      notifications: "Уведомления",
       permissions: "Разрешения",
       diagnostics: "Диагностика",
       about: "О",
@@ -1665,6 +1733,21 @@ export const ru: TranslationResources = {
       title: "Редактор",
       vimKeybindings: "Клавиши Vim",
       vimHint: "Применяется к исходным файлам в веб- и настольной версии.",
+    },
+    notifications: {
+      title: "Уведомления",
+      permission: "Разрешение на уведомления",
+      refreshAccessibility: "Обновить разрешение на уведомления",
+      playSound: "Воспроизводить звук",
+      playSoundHint: "Воспроизводит звук при получении уведомления на компьютере",
+      test: "Проверить уведомление",
+      testHint: "Отправляет уведомление с текущими настройками",
+      permissionRequired: "Разрешите доступ к уведомлениям перед проверкой",
+      send: "Отправить",
+      sending: "Отправка...",
+      sentTitle: "Тестовое уведомление отправлено",
+      sentDescription: "Paseo передал уведомление операционной системе.",
+      sendFailedTitle: "Не удалось отправить тестовое уведомление",
     },
     hostSections: {
       projects: "Проекты",
@@ -1739,6 +1822,7 @@ export const ru: TranslationResources = {
           es: "Español",
           fr: "Français",
           ja: "日本語",
+          ko: "한국어",
           ptBR: "Português brasileiro",
           ru: "Русский",
           zhCN: "中文",
@@ -1747,6 +1831,11 @@ export const ru: TranslationResources = {
     },
     diagnostics: {
       title: "Диагностика",
+      legacyTerminalRenderer: {
+        label: "Использовать прежний рендерер терминала",
+        description: "Использовать прежний WebView-терминал после повторного открытия",
+        accessibilityLabel: "Использовать прежний рендерер терминала",
+      },
       testAudio: "Тестирование звука",
       playTest: "Игровой тест",
       playing: "Игра...",
@@ -1808,11 +1897,16 @@ export const ru: TranslationResources = {
           midnight: "Полночь",
           claude: "Клод",
           ghostty: "Призрачный",
+          pureBlack: "Чистый чёрный",
           auto: "Система",
         },
       },
       detailLevel: {
         title: "Уровень детализации",
+      },
+      chatOutline: {
+        title: "Структура чата",
+        description: "Показывать структуру для перехода между запросами",
       },
       fonts: {
         title: "Шрифты",
@@ -1844,11 +1938,15 @@ export const ru: TranslationResources = {
       searchPlaceholder: "Поиск сочетаний клавиш",
       unavailableOnMobile: "Сочетания клавиш доступны только на рабочем столе.",
       capturePrompt: "Нажмите ярлык...",
+      unassigned: "Не задано",
       actions: {
+        menu: "Действия для {{name}}",
         done: "Сделанный",
         cancel: "Отмена",
+        bind: "Привязать",
         rebind: "Перепривязка",
-        reset: "Перезагрузить",
+        clear: "Очистить",
+        reset: "Сбросить к значению по умолчанию",
         resetAll: "Сбросить все",
       },
       sections: {
@@ -1954,20 +2052,52 @@ export const ru: TranslationResources = {
     },
     permissions: {
       title: "Разрешения",
-      notifications: "Уведомления",
       microphone: "Микрофон",
       refresh: "Обновить",
       refreshing: "Освежающий...",
       refreshAccessibility: "Обновить разрешения рабочего стола",
-      test: "Тест",
       actions: {
         granted: "Предоставленный",
         request: "Запрос",
         requesting: "Запрос...",
-        busySuffix: "{{label}}...",
       },
     },
     host: {
+      appearance: {
+        title: "Оформление",
+        name: {
+          label: "Имя",
+        },
+        color: {
+          label: "Цвет",
+          accessibilityLabel: "Цвет, {{value}}",
+          options: {
+            none: "По умолчанию",
+            violet: "Фиолетовый",
+            sky: "Небесный",
+            emerald: "Изумрудный",
+            orange: "Оранжевый",
+            pink: "Розовый",
+            indigo: "Индиго",
+            teal: "Бирюзовый",
+            red: "Красный",
+            amber: "Янтарный",
+            blue: "Синий",
+          },
+        },
+        badge: {
+          label: "Значок на боковой панели",
+          accessibilityLabel: "Значок на боковой панели, {{value}}",
+          options: {
+            name: "Имя",
+            icon: "Только значок",
+            hidden: "Скрыт",
+          },
+        },
+        preview: {
+          workspaceName: "my-workspace",
+        },
+      },
       notFound: "Host не найден",
       badges: {
         relay: "Реле",

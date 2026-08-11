@@ -63,6 +63,7 @@ import {
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
   type AgentClient,
+  type AgentCreateConfigUnattendedInput,
   type AgentFeature,
   type AgentLaunchContext,
   type AgentMetadata,
@@ -90,9 +91,15 @@ import {
   type ListImportableSessionsOptions,
   type McpServerConfig,
   type ProviderCatalog,
+  type ResolveAgentCreateConfigInput,
+  type ResolveAgentCreateConfigResult,
   type ToolCallDetail,
   type ToolCallTimelineItem,
 } from "../agent-sdk-types.js";
+import {
+  isDefaultAgentCreateConfigUnattended,
+  resolveDefaultAgentCreateConfig,
+} from "../create-agent-mode.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import {
   checkProviderLaunchAvailable,
@@ -113,6 +120,8 @@ import {
   truncateForDiagnostic,
 } from "./diagnostic-utils.js";
 import { withTimeout } from "../../../utils/promise-timeout.js";
+
+const ACP_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
 
 function assertChildWithPipes(
   child: ChildProcess,
@@ -366,12 +375,40 @@ export type ACPExtensionCommandsParser = (
   params: Record<string, unknown>,
 ) => AgentSlashCommand[] | null;
 
+/**
+ * Context handed to an {@link ACPCatalogModelResolver} during `fetchCatalog`. It exposes
+ * the already-derived models plus the live probe session so a resolver can refine them
+ * (e.g. switch through each model to read back per-model options) without re-implementing
+ * the catalog plumbing.
+ */
+export interface ACPCatalogModelResolverContext {
+  connection: ClientSideConnection;
+  sessionId: string;
+  models: AgentModelDefinition[];
+  configOptions: SessionConfigOption[] | null | undefined;
+  runRequest: <T>(request: () => Promise<T>) => Promise<T>;
+  transformConfigOptions: (configOptions: SessionConfigOption[]) => SessionConfigOption[];
+  logger: Logger;
+  provider: string;
+}
+
+/**
+ * Optional hook that refines the catalog's model list using the live probe session.
+ * The base client ships no resolver — catalog discovery derives models from the initial
+ * session response and never mutates the probe. Providers that need per-model data (Kimi)
+ * inject a resolver so the extra round trips stay off every other ACP.
+ */
+export type ACPCatalogModelResolver = (
+  context: ACPCatalogModelResolverContext,
+) => Promise<AgentModelDefinition[]>;
+
 interface ACPAgentClientOptions {
   provider: string;
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
   defaultCommand: [string, ...string[]];
   defaultModes?: AgentMode[];
+  catalogModelResolver?: ACPCatalogModelResolver;
   modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
   sessionResponseTransformer?: (response: SessionStateResponse) => SessionStateResponse;
   configOptionsTransformer?: (configOptions: SessionConfigOption[]) => SessionConfigOption[];
@@ -491,7 +528,7 @@ interface TerminalEntry {
   rejectExit: (error: Error) => void;
 }
 
-interface ConfigOptionSelector {
+export interface ConfigOptionSelector {
   id: string;
   label: string;
   description?: string;
@@ -510,7 +547,7 @@ export interface ACPConfigFeatureOption {
   emptyOptionLabel?: string;
 }
 
-type SelectConfigOption = Extract<SessionConfigOption, { type: "select" }>;
+export type SelectConfigOption = Extract<SessionConfigOption, { type: "select" }>;
 interface SelectConfigChoice {
   value: string;
   name: string;
@@ -694,14 +731,67 @@ export function deriveFeaturesFromACP(
   });
 }
 
+function isACPAutoAcceptEnabled(config: AgentSessionConfig): boolean {
+  return config.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === true;
+}
+
+function buildACPAutoAcceptFeature(config: AgentSessionConfig): AgentFeature {
+  return {
+    type: "toggle",
+    id: ACP_AUTO_ACCEPT_FEATURE_ID,
+    label: "Auto Accept",
+    description: "Automatically approves ACP permission prompts.",
+    tooltip: "Auto accept permission prompts",
+    icon: "shield-check",
+    value: isACPAutoAcceptEnabled(config),
+  };
+}
+
+function resolveACPCreateConfig(
+  input: ResolveAgentCreateConfigInput,
+): ResolveAgentCreateConfigResult {
+  const isUnattendedCreate = input.unattended || input.parent?.isUnattended === true;
+  const featureValues =
+    isUnattendedCreate && input.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === undefined
+      ? { ...input.featureValues, [ACP_AUTO_ACCEPT_FEATURE_ID]: true }
+      : input.featureValues;
+
+  if (
+    input.requestedMode === undefined &&
+    isUnattendedCreate &&
+    input.parent !== null &&
+    input.parent.provider !== input.provider
+  ) {
+    return { modeId: undefined, featureValues };
+  }
+
+  return resolveDefaultAgentCreateConfig({ ...input, featureValues });
+}
+
+function isACPCreateConfigUnattended(input: AgentCreateConfigUnattendedInput): boolean {
+  return (
+    isDefaultAgentCreateConfigUnattended(input) ||
+    input.config.featureValues?.[ACP_AUTO_ACCEPT_FEATURE_ID] === true ||
+    input.features?.some(
+      (feature) =>
+        feature.id === ACP_AUTO_ACCEPT_FEATURE_ID &&
+        feature.type === "toggle" &&
+        feature.value === true,
+    ) === true
+  );
+}
+
 export class ACPAgentClient implements AgentClient {
   readonly provider: string;
   readonly capabilities: AgentCapabilityFlags;
+  readonly resolveCreateConfig = resolveACPCreateConfig;
+  readonly isCreateConfigUnattended = isACPCreateConfigUnattended;
 
   protected readonly logger: Logger;
   protected readonly runtimeSettings?: ProviderRuntimeSettings;
   protected readonly defaultCommand: [string, ...string[]];
   protected readonly defaultModes: AgentMode[];
+  private readonly catalogModelResolver?: ACPCatalogModelResolver;
   private readonly modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
   private readonly sessionResponseTransformer?: (
     response: SessionStateResponse,
@@ -741,6 +831,7 @@ export class ACPAgentClient implements AgentClient {
     this.runtimeSettings = options.runtimeSettings;
     this.defaultCommand = options.defaultCommand;
     this.defaultModes = options.defaultModes ?? [];
+    this.catalogModelResolver = options.catalogModelResolver;
     this.modelTransformer = options.modelTransformer;
     this.sessionResponseTransformer = options.sessionResponseTransformer;
     this.configOptionsTransformer = options.configOptionsTransformer;
@@ -863,11 +954,26 @@ export class ACPAgentClient implements AgentClient {
           }),
         );
         const transformed = this.transformSessionResponse(response);
-        const models = deriveModelDefinitionsFromACP(
+        const derivedModels = deriveModelDefinitionsFromACP(
           this.provider,
           transformed.models,
           transformed.configOptions,
         );
+        const models = this.catalogModelResolver
+          ? await this.catalogModelResolver({
+              connection: initializedProbe.connection,
+              sessionId: response.sessionId,
+              models: derivedModels,
+              configOptions: transformed.configOptions,
+              runRequest: (request) => this.runACPRequest(request),
+              transformConfigOptions: (configOptions) =>
+                this.configOptionsTransformer
+                  ? this.configOptionsTransformer(configOptions)
+                  : configOptions,
+              logger: this.logger,
+              provider: this.provider,
+            })
+          : derivedModels;
         const modeInfo = deriveModesFromACP(
           this.defaultModes,
           transformed.modes,
@@ -892,8 +998,9 @@ export class ACPAgentClient implements AgentClient {
   }
 
   async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
+    const autoAcceptFeature = buildACPAutoAcceptFeature(config);
     if (this.configFeatureOptions.length === 0) {
-      return [];
+      return [autoAcceptFeature];
     }
 
     this.assertProvider(config);
@@ -906,7 +1013,10 @@ export class ACPAgentClient implements AgentClient {
         }),
       );
       const transformed = this.transformSessionResponse(response);
-      return deriveFeaturesFromACP(transformed.configOptions, this.configFeatureOptions);
+      return [
+        autoAcceptFeature,
+        ...deriveFeaturesFromACP(transformed.configOptions, this.configFeatureOptions),
+      ];
     } finally {
       await this.closeProbe(probe);
     }
@@ -1562,7 +1672,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   get features(): AgentFeature[] {
-    return deriveFeaturesFromACP(this.configOptions, this.configFeatureOptions);
+    return [
+      buildACPAutoAcceptFeature(this.config),
+      ...deriveFeaturesFromACP(this.configOptions, this.configFeatureOptions),
+    ];
   }
 
   private ensureCommandsReadyDeferred(): void {
@@ -1902,6 +2015,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       throw new Error("ACP session not initialized");
     }
 
+    if (featureId === ACP_AUTO_ACCEPT_FEATURE_ID) {
+      this.config.featureValues = {
+        ...this.config.featureValues,
+        [ACP_AUTO_ACCEPT_FEATURE_ID]: value === true,
+      };
+      return;
+    }
+
     const featureOption = this.configFeatureOptions.find((option) => option.id === featureId);
     if (!featureOption) {
       throw new Error(`Unknown ${this.provider} feature: ${featureId}`);
@@ -1977,8 +2098,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       throw new Error(`No pending permission request with id '${requestId}'`);
     }
 
-    this.pendingPermissions.delete(requestId);
     const selectedOption = selectPermissionOption(pending.options, response);
+    if (response.selectedActionId !== undefined && !selectedOption) {
+      throw new Error(
+        `ACP permission action '${response.selectedActionId}' does not exist or does not match '${response.behavior}' behavior`,
+      );
+    }
+
+    this.pendingPermissions.delete(requestId);
     pending.resolve(
       selectedOption
         ? {
@@ -2083,7 +2210,22 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    // Match Zed acp.rs:3189-3220: generic ACP permission requests stay pure pass-through.
+    const canAutoAccept =
+      isACPAutoAcceptEnabled(this.config) && !isACPChooserRequest(params.options);
+    if (canAutoAccept) {
+      const allowOption = selectPermissionOption(params.options, { behavior: "allow" });
+      if (allowOption) {
+        this.logger.info(
+          { toolCallId: params.toolCall.toolCallId, optionId: allowOption.optionId },
+          "Auto-accepting ACP permission request",
+        );
+        return {
+          outcome: { outcome: "selected", optionId: allowOption.optionId },
+        };
+      }
+    }
+
+    // Match Zed acp.rs:3189-3220 when Paseo is not handling the request locally.
     const requestId = randomUUID();
     let toolSnapshot =
       this.toolCalls.get(params.toolCall.toolCallId) ??
@@ -2833,7 +2975,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 }
 
-function findSelectConfigOption({
+export function findSelectConfigOption({
   configOptions,
   category,
   id,
@@ -2939,7 +3081,7 @@ function normalizeConfigFeatureValue(value: unknown): string {
   throw new Error(`ACP feature value must be a string`);
 }
 
-function deriveSelectorOptions(
+export function deriveSelectorOptions(
   configOptions: SessionConfigOption[] | null | undefined,
   category: string,
 ): ConfigOptionSelector[] {
@@ -3352,13 +3494,28 @@ function mapPermissionRequest(
   snapshot: ACPToolSnapshot,
 ): AgentPermissionRequest {
   const kind: AgentPermissionRequestKind = snapshot.kind === "switch_mode" ? "mode" : "tool";
+  const chooserText = isACPChooserRequest(params.options)
+    ? extractToolText(params.toolCall.content)
+    : undefined;
   return {
     id: requestId,
     provider,
     name: snapshot.kind ?? snapshot.title,
     kind,
     title: params.toolCall.title ?? snapshot.title,
-    detail: mapToolDetail(snapshot, new Map()),
+    detail: chooserText
+      ? {
+          type: "plain_text",
+          label: params.toolCall.title ?? snapshot.title,
+          text: chooserText,
+          icon: "wrench",
+        }
+      : mapToolDetail(snapshot, new Map()),
+    actions: params.options.map((option) => ({
+      id: option.optionId,
+      label: option.name,
+      behavior: option.kind.startsWith("allow") ? "allow" : "deny",
+    })),
     metadata: {
       toolCallId: params.toolCall.toolCallId,
       rawRequest: params,
@@ -3371,6 +3528,13 @@ function selectPermissionOption(
   options: PermissionOption[],
   response: AgentPermissionResponse,
 ): PermissionOption | null {
+  if (response.selectedActionId !== undefined) {
+    const selectedOption = options.find((option) => option.optionId === response.selectedActionId);
+    if (!selectedOption) return null;
+    const selectedBehavior = selectedOption.kind.startsWith("allow") ? "allow" : "deny";
+    return selectedBehavior === response.behavior ? selectedOption : null;
+  }
+
   const order =
     response.behavior === "allow"
       ? ["allow_once", "allow_always"]
@@ -3382,6 +3546,20 @@ function selectPermissionOption(
     }
   }
   return null;
+}
+
+function isACPChooserRequest(options: PermissionOption[]): boolean {
+  const allowKinds = new Set<PermissionOption["kind"]>();
+  for (const option of options) {
+    if (!option.kind.startsWith("allow")) {
+      continue;
+    }
+    if (allowKinds.has(option.kind)) {
+      return true;
+    }
+    allowKinds.add(option.kind);
+  }
+  return false;
 }
 
 function appendTerminalOutput(entry: TerminalEntry, chunk: string): void {

@@ -1,6 +1,7 @@
-import { watch, type FSWatcher } from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import parcelWatcher from "@parcel/watcher";
 import { LRUCache } from "lru-cache";
 import pLimit from "p-limit";
 import type pino from "pino";
@@ -14,9 +15,11 @@ import {
   type CheckoutDiffCompare,
   type CheckoutDiffResult,
   getCheckoutDiff,
+  getCheckoutRefDerivedState,
   getCheckoutSnapshotFacts,
   getCheckoutShortstat,
   getCheckoutStatus,
+  getCheckoutWorktreeState,
   getPullRequestStatus,
   forgeAuthStateFromError,
   hasOriginRemote,
@@ -38,19 +41,40 @@ import {
   type ForgeResolver,
 } from "../services/forge-resolver.js";
 import { parseGitRevParsePath } from "../utils/git-rev-parse-path.js";
+import {
+  createRealpathAwarePathMatcher,
+  getRealpathAwareRelativePath,
+  isRealpathInsideRoot,
+} from "../utils/path.js";
 import { runGitCommand } from "../utils/run-git-command.js";
+import { branchNameFromRef } from "../utils/worktree-metadata.js";
 import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
 import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
+import { classifyGitMetadataPath, getPrunedGitMetadataPaths } from "./git-metadata-event-rules.js";
+import {
+  fetchWorkspaceGitRemote,
+  type WorkspaceGitFetchResult,
+  type WorkspaceGitFetchObserver,
+  type WorkspaceGitRemoteRefChange,
+} from "./workspace-git-fetch.js";
 import { deriveProjectSlug } from "./workspace-git-metadata.js";
 import { checkoutLiteFromGitSnapshot } from "./workspace-registry-model.js";
 
 const WORKSPACE_GIT_WATCH_DEBOUNCE_MS = 1_000;
 const BACKGROUND_GIT_FETCH_INTERVAL_MS = 180_000;
+const FETCH_METADATA_ECHO_TTL_MS = 5_000;
 export const WORKSPACE_GIT_SELF_HEAL_INTERVAL_MS = 60_000;
 const FORGE_PR_STATUS_POLL_FAST_INTERVAL_MS = 20_000;
 const FORGE_PR_STATUS_POLL_SLOW_INTERVAL_MS = 120_000;
 const FORGE_PR_STATUS_POLL_ERROR_BACKOFF_CAP_MS = 300_000;
-const WORKING_TREE_WATCH_FALLBACK_REFRESH_MS = 5_000;
+const DEGRADED_GIT_POLL_INTERVAL_MS = 5_000;
+// Keep whole workspace pipelines below the lower-level Git process pool so daemon control work
+// retains subprocess and event-loop headroom during large workspace reconciliation bursts.
+export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
+export const WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY = 2;
+export const WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS = 10_000;
+const WATCH_RECOVERY_BASE_DELAY_MS = 30_000;
+const WATCH_RECOVERY_MAX_ATTEMPTS = 3;
 // Auxiliary reads may reuse cached values within this window; snapshots do not expire on read.
 const WORKSPACE_GIT_AUXILIARY_READ_TTL_MS = 15_000;
 // Non-forced refresh triggers share this minimum gap to absorb watcher/self-heal bursts; force bypasses it.
@@ -59,14 +83,27 @@ const WORKSPACE_GIT_INTERNAL_MIN_GAP_MS = 2_000;
 const WORKSPACE_GIT_CHECKOUT_DIFF_CACHE_MAX = 64;
 // Small values (booleans, short strings, small arrays); generous cap.
 const WORKSPACE_GIT_AUXILIARY_CACHE_MAX = 256;
-const WORKSPACE_GIT_FACTS_REUSE_TTL_MS = 1_000;
-const LINUX_WATCH_MAX_DIRS = 5_000;
-const LINUX_WATCH_REFRESH_COOLDOWN_MS = 2_000;
-const LINUX_WATCH_IGNORE_TTL_MS = 5 * 60 * 1_000;
 
-const linuxWatchReaddirConcurrency =
-  parseInt(process.env.PASEO_LINUX_WATCH_READDIR_CONCURRENCY ?? "16", 10) || 16;
-const linuxWatchReaddirLimit = pLimit(linuxWatchReaddirConcurrency);
+function mergeSets<T>(
+  left: ReadonlySet<T>,
+  right: ReadonlySet<T>,
+): { merged: Set<T>; added: boolean } {
+  const merged = new Set(left);
+  let added = false;
+  for (const value of right) {
+    if (!merged.has(value)) {
+      merged.add(value);
+      added = true;
+    }
+  }
+  return { merged, added };
+}
+
+export function getWorkspaceGitSelfHealPhaseMs(cwd: string): number {
+  return (
+    createHash("sha256").update(cwd).digest().readUInt32BE(0) % WORKSPACE_GIT_SELF_HEAL_INTERVAL_MS
+  );
+}
 
 export interface WorkspaceGitRuntimeSnapshot {
   cwd: string;
@@ -80,6 +117,7 @@ export interface WorkspaceGitRuntimeSnapshot {
     isDirty: boolean | null;
     baseRef: string | null;
     aheadBehind: { ahead: number; behind: number } | null;
+    upstreamRef: string | null;
     aheadOfOrigin: number | null;
     behindOfOrigin: number | null;
     hasRemote: boolean;
@@ -188,8 +226,13 @@ export interface WorkspaceGitServiceMetrics {
   workingTreeWatchSetupInFlightCount: number;
   workspaceRefreshInFlightCount: number;
   workspaceRefreshQueuedCount: number;
+  workspaceRefreshAdmissionActiveCount: number;
+  workspaceRefreshAdmissionPendingCount: number;
+  workspaceObservationSetupAdmissionActiveCount: number;
+  workspaceObservationSetupAdmissionPendingCount: number;
   fetchInFlightCount: number;
   snapshotUpdatedListenerCount: number;
+  watcherErrorCallbackCount: number;
 }
 
 export type WorkspaceGitListener = (snapshot: WorkspaceGitRuntimeSnapshot) => void;
@@ -243,15 +286,24 @@ export type WorkspaceGitSnapshotOptions =
 
 interface WorkspaceGitRefreshRequest {
   force: boolean;
+  refreshStructure: boolean;
+  refreshWorktree: boolean;
   includeForge: boolean;
+  emitUnchanged?: boolean;
   reason: string;
   notify: boolean;
+  queueIfBusy: boolean;
+  movedRemoteRefs: Set<string>;
 }
 
 interface ScheduledWorkspaceGitRefreshOptions {
   force?: boolean;
+  scope?: "refs" | "structure" | "worktree";
   includeForge?: boolean;
+  emitUnchanged?: boolean;
   reason?: string;
+  queueIfBusy?: boolean;
+  movedRemoteRefs?: ReadonlySet<string>;
 }
 
 type WorkspaceGitRefreshState =
@@ -261,17 +313,17 @@ type WorkspaceGitRefreshState =
   | {
       status: "in-flight";
       promise: Promise<WorkspaceGitRuntimeSnapshot>;
-      force: boolean;
-      includeForge: boolean;
+      request: WorkspaceGitRefreshRequest;
       queued: WorkspaceGitRefreshRequest | null;
     };
 
 interface WorkspaceGitServiceDependencies {
-  watch: typeof watch;
-  readdir: typeof readdir;
+  subscribe: typeof parcelWatcher.subscribe;
   getCheckoutSnapshotFacts: typeof getCheckoutSnapshotFacts;
+  getCheckoutRefDerivedState: typeof getCheckoutRefDerivedState;
   getCheckoutStatus: typeof getCheckoutStatus;
   getCheckoutShortstat: typeof getCheckoutShortstat;
+  getCheckoutWorktreeState: typeof getCheckoutWorktreeState;
   getCheckoutDiff: typeof getCheckoutDiff;
   getPullRequestStatus: typeof getPullRequestStatus;
   resolveBranchCheckout: typeof resolveBranchCheckout;
@@ -286,8 +338,12 @@ interface WorkspaceGitServiceDependencies {
   forgeOverrides?: Record<string, ForgeService>;
   resolveAbsoluteGitDir: (cwd: string) => Promise<string | null>;
   hasOriginRemote: (cwd: string) => Promise<boolean>;
-  runGitFetch: (cwd: string) => Promise<void>;
+  runGitFetch: (
+    cwd: string,
+    observer: WorkspaceGitFetchObserver,
+  ) => Promise<WorkspaceGitFetchResult>;
   runGitCommand: typeof runGitCommand;
+  getWorkspaceGitSelfHealPhaseMs: typeof getWorkspaceGitSelfHealPhaseMs;
   now: () => Date;
 }
 
@@ -298,10 +354,52 @@ interface WorkspaceGitServiceOptions {
   deps?: Partial<WorkspaceGitServiceDependencies>;
 }
 
+export function getWorkspaceFileWatcherBackend(
+  platform: NodeJS.Platform,
+): parcelWatcher.BackendType {
+  switch (platform) {
+    case "darwin":
+      return "fs-events";
+    case "linux":
+      return "inotify";
+    case "win32":
+      return "windows";
+    default:
+      throw new Error(`No native workspace file watcher configured for ${platform}`);
+  }
+}
+
+export function subscribeToWorkspaceFileChanges(
+  directory: string,
+  callback: parcelWatcher.SubscribeCallback,
+  options?: parcelWatcher.Options,
+): Promise<parcelWatcher.AsyncSubscription> {
+  return parcelWatcher.subscribe(directory, callback, {
+    ...options,
+    backend: getWorkspaceFileWatcherBackend(process.platform),
+  });
+}
+
+class WorkspaceGitServiceDisposedError extends Error {
+  constructor() {
+    super("WorkspaceGitService is disposed");
+    this.name = "WorkspaceGitServiceDisposedError";
+  }
+}
+
+class WorkspaceGitWatcherSubscriptionTimeoutError extends Error {
+  constructor(watchPath: string) {
+    super(
+      `Watcher subscription for ${watchPath} timed out after ${WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS}ms`,
+    );
+    this.name = "WorkspaceGitWatcherSubscriptionTimeoutError";
+  }
+}
+
 interface WorkspaceGitTarget {
   cwd: string;
   listeners: Set<WorkspaceGitListener>;
-  watchers: FSWatcher[];
+  workingTreeWatchTarget: WorkingTreeWatchTarget | null;
   debounceTimer: NodeJS.Timeout | null;
   pendingDebounceRequest: WorkspaceGitRefreshRequest | null;
   selfHealTimer: NodeJS.Timeout | null;
@@ -310,12 +408,14 @@ interface WorkspaceGitTarget {
   refreshState: WorkspaceGitRefreshState;
   latestGit: WorkspaceGitRuntimeSnapshot["git"] | null;
   latestGitLoadedAtMs: number | null;
+  latestStructuralRefreshAtMs: number | null;
+  latestWorktreeRefreshAtMs: number | null;
+  auditWindowStartedAtMs: number | null;
   latestForge: WorkspaceGitRuntimeSnapshot["forge"] | null;
   latestForgeLoadedAtMs: number | null;
   latestSnapshot: WorkspaceGitRuntimeSnapshot | null;
   latestSnapshotLoadedAtMs: number | null;
   latestFacts: CheckoutSnapshotFacts | null;
-  latestFactsLoadedAtMs: number | null;
   factsPromise: Promise<CheckoutSnapshotFacts> | null;
   latestFingerprint: string | null;
   lastShellOutAtMs: number | null;
@@ -329,21 +429,58 @@ interface RepoGitTarget {
   repoGitRoot: string;
   cwd: string;
   workspaceKeys: Set<string>;
+  subscription: parcelWatcher.AsyncSubscription | null;
+  fallbackPolling: boolean;
+  fallbackPollTimer: NodeJS.Timeout | null;
+  recovery: WatchRecoveryState;
   intervalId: NodeJS.Timeout | null;
   fetchInFlight: boolean;
+  bufferedFetchMetadataEvents: parcelWatcher.Event[];
+  recentFetchRemoteRefChanges: Map<
+    string,
+    { change: WorkspaceGitRemoteRefChange; expiresAtMs: number }
+  >;
+  knownRemoteRefs: Set<string> | null;
+  closed: boolean;
+}
+
+interface RepoMetadataWorkspaceRefresh {
+  refreshBase: boolean;
+  structural: boolean;
+  movedRemoteRefs: Set<string>;
+  queueIfBusy: boolean;
 }
 
 interface WorkingTreeWatchTarget {
   cwd: string;
+  watchPath: string;
   repoRoot: string | null;
-  repoWatchPath: string | null;
-  watchers: FSWatcher[];
-  watchedPaths: Set<string>;
-  fallbackRefreshInterval: NodeJS.Timeout | null;
-  linuxTreeRefreshPromise: Promise<void> | null;
-  linuxTreeRefreshQueued: boolean;
+  subscription: parcelWatcher.AsyncSubscription | null;
+  ignoredDirectories: Set<string>;
+  ignoredDirectoriesRefreshPromise: Promise<void> | null;
+  aliases: Set<string>;
+  workspaceKeys: Set<string>;
+  fallbackPolling: boolean;
+  fallbackPollTimer: NodeJS.Timeout | null;
+  recovery: WatchRecoveryState;
   listeners: Set<() => void>;
+  closed: boolean;
 }
+
+interface WatchRecoveryState {
+  attemptCount: number;
+  timer: NodeJS.Timeout | null;
+}
+
+function setsEqual(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
+}
+
+type WorkingTreeWatchFallbackReason =
+  | "not_a_git_checkout"
+  | "watcher_error"
+  | "watcher_setup_failed"
+  | "watcher_teardown_failed";
 
 interface WorkspaceGitAuxiliaryReadCacheEntry<T> {
   value: T | null;
@@ -360,11 +497,12 @@ interface WorkspaceForgePrStatusPollTarget {
 
 function buildDefaultWorkspaceGitServiceDeps(): WorkspaceGitServiceDependencies {
   return {
-    watch,
-    readdir,
+    subscribe: subscribeToWorkspaceFileChanges,
     getCheckoutSnapshotFacts,
+    getCheckoutRefDerivedState,
     getCheckoutStatus,
     getCheckoutShortstat,
+    getCheckoutWorktreeState,
     getCheckoutDiff,
     getPullRequestStatus,
     resolveBranchCheckout,
@@ -373,8 +511,9 @@ function buildDefaultWorkspaceGitServiceDeps(): WorkspaceGitServiceDependencies 
     listPaseoWorktrees,
     resolveAbsoluteGitDir,
     hasOriginRemote,
-    runGitFetch,
+    runGitFetch: fetchWorkspaceGitRemote,
     runGitCommand,
+    getWorkspaceGitSelfHealPhaseMs,
     now: () => new Date(),
   };
 }
@@ -391,12 +530,23 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private readonly worktreesRoot: string | undefined;
   private readonly deps: WorkspaceGitServiceDependencies;
   private readonly forgeResolver: ForgeResolver;
+  private readonly workspaceRefreshLimit = pLimit({
+    concurrency: WORKSPACE_GIT_REFRESH_CONCURRENCY,
+    rejectOnClear: true,
+  });
+  private readonly workspaceObservationSetupLimit = pLimit({
+    concurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
+    rejectOnClear: true,
+  });
+  private readonly disposeController = new AbortController();
+  private disposed = false;
   private readonly snapshotUpdatedListeners = new Set<WorkspaceGitSnapshotUpdatedListener>();
   private readonly workspaceTargets = new Map<string, WorkspaceGitTarget>();
   private readonly repoTargets = new Map<string, RepoGitTarget>();
   private readonly workingTreeWatchTargets = new Map<string, WorkingTreeWatchTarget>();
   private readonly workingTreeWatchSetups = new Map<string, Promise<WorkingTreeWatchTarget>>();
-  private readonly linuxIgnoredDirsCache = new Map<string, { ignored: Set<string>; ts: number }>();
+  private readonly workingTreeWatchResolutions = new Map<string, Promise<WorkingTreeWatchTarget>>();
+  private readonly workingTreeWatchAliases = new Map<string, string>();
   private readonly branchValidationCache = new LRUCache<
     string,
     WorkspaceGitAuxiliaryReadCacheEntry<WorkspaceGitBranchValidationResult>
@@ -425,6 +575,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     string,
     WorkspaceGitAuxiliaryReadCacheEntry<CheckoutDiffResult>
   >({ max: WORKSPACE_GIT_CHECKOUT_DIFF_CACHE_MAX });
+  private watcherErrorCallbackCount = 0;
   constructor(options: WorkspaceGitServiceOptions) {
     this.logger = options.logger.child({ module: "workspace-git-service" });
     this.paseoHome = options.paseoHome;
@@ -436,6 +587,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   resolveForge(cwd: string): Promise<ForgeResolution | null> {
+    this.assertNotDisposed();
     return this.forgeResolver.resolve(resolve(cwd));
   }
 
@@ -443,6 +595,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     params: { cwd: string },
     listener: WorkspaceGitListener,
   ): WorkspaceGitSubscription {
+    this.assertNotDisposed();
     const cwd = resolve(params.cwd);
     const target = this.ensureWorkspaceTarget(cwd);
     target.listeners.add(listener);
@@ -462,6 +615,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   onSnapshotUpdated(listener: WorkspaceGitSnapshotUpdatedListener): WorkspaceGitSubscription {
+    this.assertNotDisposed();
     this.snapshotUpdatedListeners.add(listener);
     return {
       unsubscribe: () => {
@@ -512,8 +666,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       workingTreeWatchSetupInFlightCount: this.workingTreeWatchSetups.size,
       workspaceRefreshInFlightCount,
       workspaceRefreshQueuedCount,
+      workspaceRefreshAdmissionActiveCount: this.workspaceRefreshLimit.activeCount,
+      workspaceRefreshAdmissionPendingCount: this.workspaceRefreshLimit.pendingCount,
+      workspaceObservationSetupAdmissionActiveCount:
+        this.workspaceObservationSetupLimit.activeCount,
+      workspaceObservationSetupAdmissionPendingCount:
+        this.workspaceObservationSetupLimit.pendingCount,
       fetchInFlightCount,
       snapshotUpdatedListenerCount: this.snapshotUpdatedListeners.size,
+      watcherErrorCallbackCount: this.watcherErrorCallbackCount,
     };
   }
 
@@ -521,6 +682,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     cwd: string,
     options?: WorkspaceGitSnapshotOptions,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
+    this.assertNotDisposed();
     cwd = resolve(cwd);
     const request = this.normalizeRefreshRequest(options, "getSnapshot", true);
     const target = this.ensureWorkspaceTarget(cwd);
@@ -532,6 +694,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
+    this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const status = await this.deps.getCheckoutStatus(normalizedCwd, {
       paseoHome: this.paseoHome,
@@ -568,6 +731,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options: CheckoutDiffCompare,
     readOptions?: WorkspaceGitReadOptions,
   ): Promise<CheckoutDiffResult> {
+    this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const normalizedOptions = this.normalizeCheckoutDiffOptions(options);
     const key = this.buildCheckoutDiffCacheKey(normalizedCwd, normalizedOptions);
@@ -603,11 +767,21 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     ]);
   }
 
+  private invalidateCheckoutDiffCache(cwd: string, mode: CheckoutDiffCompare["mode"]): void {
+    for (const key of this.checkoutDiffCache.keys()) {
+      const [kind, cachedCwd, cachedMode] = JSON.parse(key) as unknown[];
+      if (kind === "checkout-diff" && cachedCwd === cwd && cachedMode === mode) {
+        this.checkoutDiffCache.delete(key);
+      }
+    }
+  }
+
   validateBranchRef(
     cwd: string,
     ref: string,
     options?: WorkspaceGitReadOptions,
   ): Promise<WorkspaceGitBranchValidationResult> {
+    this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const normalizedRef = ref.trim();
     const key = JSON.stringify(["branch-validation", normalizedCwd, normalizedRef]);
@@ -617,6 +791,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   hasLocalBranch(cwd: string, branch: string, options?: WorkspaceGitReadOptions): Promise<boolean> {
+    this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const normalizedBranch = branch.trim();
     const ref = `refs/heads/${normalizedBranch}`;
@@ -636,6 +811,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options?: WorkspaceGitBranchSuggestionsOptions,
     readOptions?: WorkspaceGitReadOptions,
   ): Promise<WorkspaceGitBranchSuggestion[]> {
+    this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const query = options?.query ?? "";
     const limit = options?.limit;
@@ -650,6 +826,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options?: WorkspaceGitStashListOptions,
     readOptions?: WorkspaceGitReadOptions,
   ): Promise<WorkspaceGitStashEntry[]> {
+    this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const paseoOnly = options?.paseoOnly !== false;
     const key = JSON.stringify(["stashes", normalizedCwd, paseoOnly]);
@@ -666,6 +843,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     cwdOrRepoRoot: string,
     options?: WorkspaceGitReadOptions,
   ): Promise<WorkspaceGitWorktreeInfo[]> {
+    this.assertNotDisposed();
     const repoRoot = await this.resolveRepoRoot(cwdOrRepoRoot, options);
     const key = JSON.stringify(["worktrees", repoRoot]);
     return this.readAuxiliaryCache(this.worktreeListCache, key, options, () =>
@@ -692,6 +870,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     cwdOrRepoRoot: string,
     options?: WorkspaceGitReadOptions,
   ): Promise<string> {
+    this.assertNotDisposed();
     const cwd = resolve(cwdOrRepoRoot);
     const key = JSON.stringify(["default-branch", cwd]);
     return this.readAuxiliaryCache(this.defaultBranchCache, key, options, async () => {
@@ -717,13 +896,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   async refresh(cwd: string, _options?: { priority?: "normal" | "high" }): Promise<void> {
+    this.assertNotDisposed();
     cwd = resolve(cwd);
     const target = this.ensureWorkspaceTarget(cwd);
     await this.refreshWorkspaceTarget(target, {
       force: false,
+      refreshStructure: true,
+      refreshWorktree: true,
       includeForge: false,
       reason: "refresh",
       notify: true,
+      queueIfBusy: false,
+      movedRemoteRefs: new Set(),
     });
     this.scheduleWorkspaceObservationSetup(target);
   }
@@ -732,6 +916,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     cwd: string,
     onChange: () => void,
   ): Promise<{ repoRoot: string | null; unsubscribe: () => void }> {
+    this.assertNotDisposed();
     cwd = resolve(cwd);
     const target = await this.ensureWorkingTreeWatchTarget(cwd);
     target.listeners.add(onChange);
@@ -739,20 +924,22 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return {
       repoRoot: target.repoRoot,
       unsubscribe: () => {
-        this.removeWorkingTreeWatchListener(cwd, onChange);
+        this.removeWorkingTreeWatchListener(target.cwd, onChange);
       },
     };
   }
 
   scheduleRefreshForCwd(cwd: string): void {
+    this.assertNotDisposed();
     cwd = resolve(cwd);
     const target = this.workspaceTargets.get(cwd);
     if (target) {
-      this.scheduleWorkspaceRefresh(target);
+      this.scheduleWorkspaceRefresh(target, { queueIfBusy: false });
     }
   }
 
   onWorkspaceStateMayHaveChanged(cwd: string): void {
+    this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const target = this.workspaceTargets.get(normalizedCwd);
     if (!target || target.closed) {
@@ -772,10 +959,19 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
    * git mutations to force a fresh forge status on the next refresh.
    */
   invalidateForge(cwd: string): void {
+    this.assertNotDisposed();
     this.forgeResolver.invalidate(resolve(cwd));
   }
 
   dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.disposeController.abort(new WorkspaceGitServiceDisposedError());
+    this.workspaceRefreshLimit.clearQueue();
+    this.workspaceObservationSetupLimit.clearQueue();
+
     for (const target of this.workspaceTargets.values()) {
       this.closeWorkspaceTarget(target);
     }
@@ -791,10 +987,19 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     this.workingTreeWatchTargets.clear();
     this.workingTreeWatchSetups.clear();
+    this.workingTreeWatchResolutions.clear();
+    this.workingTreeWatchAliases.clear();
     this.snapshotUpdatedListeners.clear();
   }
 
+  private assertNotDisposed(): void {
+    if (this.disposed) {
+      throw new WorkspaceGitServiceDisposedError();
+    }
+  }
+
   private ensureWorkspaceTarget(cwd: string): WorkspaceGitTarget {
+    this.assertNotDisposed();
     const existingTarget = this.workspaceTargets.get(cwd);
     if (existingTarget) {
       return existingTarget;
@@ -809,6 +1014,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options: WorkspaceGitReadOptions | undefined,
     load: () => Promise<T>,
   ): Promise<T> {
+    this.assertNotDisposed();
     if (options?.force && !options.reason) {
       throw new Error("WorkspaceGitService forced read requires a reason");
     }
@@ -864,29 +1070,69 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return entry;
   }
 
-  private async ensureWorkingTreeWatchTarget(cwd: string): Promise<WorkingTreeWatchTarget> {
-    const existingTarget = this.workingTreeWatchTargets.get(cwd);
+  private ensureWorkingTreeWatchTarget(cwd: string): Promise<WorkingTreeWatchTarget> {
+    this.assertNotDisposed();
+    const targetCwd = this.workingTreeWatchAliases.get(cwd);
+    if (targetCwd) {
+      const existingTarget = this.workingTreeWatchTargets.get(targetCwd);
+      if (existingTarget) {
+        return Promise.resolve(existingTarget);
+      }
+      this.workingTreeWatchAliases.delete(cwd);
+    }
+
+    const existingResolution = this.workingTreeWatchResolutions.get(cwd);
+    if (existingResolution) {
+      return existingResolution;
+    }
+
+    const resolution = this.resolveWorkingTreeWatchTarget(cwd).finally(() => {
+      if (this.workingTreeWatchResolutions.get(cwd) === resolution) {
+        this.workingTreeWatchResolutions.delete(cwd);
+      }
+    });
+    this.workingTreeWatchResolutions.set(cwd, resolution);
+    return resolution;
+  }
+
+  private async resolveWorkingTreeWatchTarget(cwd: string): Promise<WorkingTreeWatchTarget> {
+    const repoRoot = await this.resolveCheckoutWatchRoot(cwd);
+    const targetCwd = repoRoot ?? cwd;
+    const existingTarget = this.workingTreeWatchTargets.get(targetCwd);
     if (existingTarget) {
+      this.rememberWorkingTreeWatchAlias(existingTarget, cwd);
       return existingTarget;
     }
 
-    const existingSetup = this.workingTreeWatchSetups.get(cwd);
+    const existingSetup = this.workingTreeWatchSetups.get(targetCwd);
     if (existingSetup) {
-      return existingSetup;
+      const target = await existingSetup;
+      this.rememberWorkingTreeWatchAlias(target, cwd);
+      return target;
     }
 
-    const setup = this.createWorkingTreeWatchTarget(cwd).finally(() => {
-      this.workingTreeWatchSetups.delete(cwd);
+    const watchPath = repoRoot && createRealpathAwarePathMatcher(repoRoot)(cwd) ? cwd : targetCwd;
+    const setup = this.createWorkingTreeWatchTarget(targetCwd, watchPath, repoRoot).finally(() => {
+      if (this.workingTreeWatchSetups.get(targetCwd) === setup) {
+        this.workingTreeWatchSetups.delete(targetCwd);
+      }
     });
-    this.workingTreeWatchSetups.set(cwd, setup);
-    return setup;
+    this.workingTreeWatchSetups.set(targetCwd, setup);
+    const target = await setup;
+    this.rememberWorkingTreeWatchAlias(target, cwd);
+    return target;
+  }
+
+  private rememberWorkingTreeWatchAlias(target: WorkingTreeWatchTarget, cwd: string): void {
+    target.aliases.add(cwd);
+    this.workingTreeWatchAliases.set(cwd, target.cwd);
   }
 
   private createWorkspaceTarget(cwd: string): WorkspaceGitTarget {
     const target: WorkspaceGitTarget = {
       cwd,
       listeners: new Set(),
-      watchers: [],
+      workingTreeWatchTarget: null,
       debounceTimer: null,
       pendingDebounceRequest: null,
       selfHealTimer: null,
@@ -895,12 +1141,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       refreshState: { status: "idle" },
       latestGit: null,
       latestGitLoadedAtMs: null,
+      latestStructuralRefreshAtMs: null,
+      latestWorktreeRefreshAtMs: null,
+      auditWindowStartedAtMs: null,
       latestForge: null,
       latestForgeLoadedAtMs: null,
       latestSnapshot: null,
       latestSnapshotLoadedAtMs: null,
       latestFacts: null,
-      latestFactsLoadedAtMs: null,
       factsPromise: null,
       latestFingerprint: null,
       lastShellOutAtMs: null,
@@ -921,9 +1169,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
       void this.refreshWorkspaceTarget(target, {
         force: false,
+        refreshStructure: true,
+        refreshWorktree: true,
         includeForge: true,
         reason: "initial",
         notify: true,
+        queueIfBusy: false,
+        movedRemoteRefs: new Set(),
       });
     });
   }
@@ -937,9 +1189,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return;
     }
 
-    target.observationSetupPromise = Promise.resolve()
-      .then(() => this.setupWorkspaceObservation(target))
+    target.observationSetupPromise = this.workspaceObservationSetupLimit(async () => {
+      if (!this.isActiveObservedWorkspaceTarget(target)) {
+        return;
+      }
+      await this.setupWorkspaceObservation(target);
+    })
       .catch((error) => {
+        if (this.disposed || !this.isActiveObservedWorkspaceTarget(target)) {
+          return;
+        }
         this.logger.warn(
           { err: error, cwd: target.cwd },
           "Failed to set up workspace git observation",
@@ -952,61 +1211,63 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   private async setupWorkspaceObservation(target: WorkspaceGitTarget): Promise<void> {
     const facts = await this.getFactsForObservation(target);
-    const gitDir = facts?.isGit ? facts.absoluteGitDir : null;
     if (!this.isActiveObservedWorkspaceTarget(target)) {
       return;
     }
-    if (!gitDir) {
+    const watchCwd = facts.isGit ? facts.worktreeRoot : target.cwd;
+    const workingTreeTargetPromise = this.ensureWorkingTreeWatchTarget(watchCwd);
+    const workingTreeTarget = await workingTreeTargetPromise;
+    if (!this.isActiveObservedWorkspaceTarget(target)) {
+      queueMicrotask(() => this.closeWorkingTreeWatchTargetIfUnused(workingTreeTarget));
+      return;
+    }
+    if (target.workingTreeWatchTarget !== workingTreeTarget) {
+      if (target.workingTreeWatchTarget) {
+        this.removeWorkspaceWorkingTreeLink(target.workingTreeWatchTarget, target.cwd);
+      }
+      target.workingTreeWatchTarget = workingTreeTarget;
+    }
+    workingTreeTarget.workspaceKeys.add(target.cwd);
+
+    if (!facts.isGit || !facts.absoluteGitDir) {
       target.observationSetupComplete = true;
       return;
     }
-
-    const repoGitRoot =
-      facts?.isGit && facts.gitCommonDir
-        ? facts.gitCommonDir
-        : await this.resolveWorkspaceGitRefsRoot(gitDir);
+    await this.promoteWorkingTreeWatchTarget(workingTreeTarget, facts.worktreeRoot);
+    const gitDir = facts.absoluteGitDir;
+    const repoGitRoot = facts.gitCommonDir ?? (await this.resolveWorkspaceGitRefsRoot(gitDir));
     if (!this.isActiveObservedWorkspaceTarget(target)) {
       return;
     }
     target.repoGitRoot = repoGitRoot;
-    this.startWorkspaceWatchers(target, gitDir, repoGitRoot);
     await this.ensureRepoTarget(target);
     if (this.isActiveObservedWorkspaceTarget(target)) {
       target.observationSetupComplete = true;
     }
   }
 
-  private async getFactsForObservation(
-    target: WorkspaceGitTarget,
-  ): Promise<CheckoutSnapshotFacts | null> {
+  private async getFactsForObservation(target: WorkspaceGitTarget): Promise<CheckoutSnapshotFacts> {
+    if (target.latestFacts) {
+      return target.latestFacts;
+    }
     return this.loadCheckoutFacts(target, {
       paseoHome: this.paseoHome,
       logger: this.logger,
-      allowRecent: true,
     });
   }
 
   private loadCheckoutFacts(
     target: WorkspaceGitTarget,
-    options: CheckoutContext & { allowRecent: boolean },
+    context: CheckoutContext,
   ): Promise<CheckoutSnapshotFacts> {
-    if (options.allowRecent && target.latestFacts && target.latestFactsLoadedAtMs !== null) {
-      const ageMs = this.deps.now().getTime() - target.latestFactsLoadedAtMs;
-      if (ageMs < WORKSPACE_GIT_FACTS_REUSE_TTL_MS) {
-        return Promise.resolve(target.latestFacts);
-      }
-    }
-
     if (target.factsPromise) {
       return target.factsPromise;
     }
 
-    const { allowRecent: _allowRecent, ...context } = options;
     const promise = this.deps
       .getCheckoutSnapshotFacts(target.cwd, context)
       .then((facts) => {
         target.latestFacts = facts;
-        target.latestFactsLoadedAtMs = this.deps.now().getTime();
         return facts;
       })
       .finally(() => {
@@ -1026,68 +1287,458 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     );
   }
 
-  private async createWorkingTreeWatchTarget(cwd: string): Promise<WorkingTreeWatchTarget> {
-    const repoRoot = await this.resolveCheckoutWatchRoot(cwd);
+  private async createWorkingTreeWatchTarget(
+    cwd: string,
+    watchPath: string,
+    repoRoot: string | null,
+  ): Promise<WorkingTreeWatchTarget> {
+    const ignoredDirectories = repoRoot ? await this.loadIgnoredDirs(watchPath) : new Set<string>();
     const target: WorkingTreeWatchTarget = {
       cwd,
+      watchPath,
       repoRoot,
-      repoWatchPath: null,
-      watchers: [],
-      watchedPaths: new Set<string>(),
-      fallbackRefreshInterval: null,
-      linuxTreeRefreshPromise: null,
-      linuxTreeRefreshQueued: false,
+      subscription: null,
+      ignoredDirectories,
+      ignoredDirectoriesRefreshPromise: null,
+      aliases: new Set([cwd]),
+      workspaceKeys: new Set(),
+      fallbackPolling: false,
+      fallbackPollTimer: null,
+      recovery: { attemptCount: 0, timer: null },
       listeners: new Set(),
+      closed: false,
     };
 
-    const repoWatchPath = repoRoot ?? cwd;
-    target.repoWatchPath = repoWatchPath;
-    const watchPaths = new Set<string>([repoWatchPath]);
-    const gitDir = await this.deps.resolveAbsoluteGitDir(cwd);
-    if (gitDir) {
-      watchPaths.add(gitDir);
-    }
-
-    let hasRecursiveRepoCoverage = false;
-    const allowRecursiveRepoWatch = process.platform !== "linux";
-    if (process.platform === "linux") {
-      hasRecursiveRepoCoverage = await this.ensureLinuxRepoTreeWatchers(target, repoWatchPath);
-    }
-    for (const watchPath of watchPaths) {
-      if (process.platform === "linux" && watchPath === repoWatchPath) {
-        continue;
-      }
-      const shouldTryRecursive = watchPath === repoWatchPath && allowRecursiveRepoWatch;
-      const watcherIsRecursive = this.addWorkingTreeWatcher(target, watchPath, shouldTryRecursive);
-      if (watchPath === repoWatchPath && watcherIsRecursive) {
-        hasRecursiveRepoCoverage = true;
-      }
-    }
-
-    const missingRepoCoverage = repoRoot === null || !hasRecursiveRepoCoverage;
-    if (target.watchers.length === 0 || missingRepoCoverage) {
-      target.fallbackRefreshInterval = setInterval(() => {
-        this.scheduleWorkspaceRefresh(cwd, {
-          force: true,
-          reason: "working-tree-watch-fallback",
-        });
-        for (const listener of target.listeners) {
-          listener();
-        }
-      }, WORKING_TREE_WATCH_FALLBACK_REFRESH_MS);
-      this.logger.warn(
-        {
-          cwd,
-          intervalMs: WORKING_TREE_WATCH_FALLBACK_REFRESH_MS,
-          reason:
-            target.watchers.length === 0 ? "no_watchers" : "missing_recursive_repo_root_coverage",
-        },
-        "Working tree watchers unavailable; using timed refresh fallback",
-      );
-    }
-
     this.workingTreeWatchTargets.set(cwd, target);
+    this.workingTreeWatchAliases.set(cwd, cwd);
+    await this.startWorkingTreeSubscription(target);
+    this.assertNotDisposed();
+
+    if (repoRoot === null) {
+      this.startWorkingTreeWatchFallback(target, "not_a_git_checkout");
+    }
+
     return target;
+  }
+
+  private async subscribeWithDeadline(
+    watchPath: string,
+    callback: parcelWatcher.SubscribeCallback,
+    options: parcelWatcher.Options,
+    onSubscribeSettled: () => void,
+    shouldAbandonSubscription: () => boolean,
+  ): Promise<parcelWatcher.AsyncSubscription> {
+    this.assertNotDisposed();
+    const signal = this.disposeController.signal;
+    let outcome: "pending" | "accepted" | "expired" = "pending";
+    let timeout: NodeJS.Timeout | null = null;
+    let removeAbortListener = () => {};
+    let unsubscribePromise: Promise<void> | null = null;
+    let subscriptionPromise: Promise<parcelWatcher.AsyncSubscription>;
+    try {
+      subscriptionPromise = this.deps
+        .subscribe(watchPath, callback, options)
+        .finally(onSubscribeSettled);
+    } catch (error) {
+      onSubscribeSettled();
+      throw error;
+    }
+    void subscriptionPromise.then(
+      (subscription) => {
+        if ((outcome === "expired" || signal.aborted) && !shouldAbandonSubscription()) {
+          unsubscribePromise ??= this.unsubscribeWatcherSubscription(subscription, watchPath);
+          return unsubscribePromise;
+        }
+        return undefined;
+      },
+      () => undefined,
+    );
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        outcome = "expired";
+        reject(new WorkspaceGitWatcherSubscriptionTimeoutError(watchPath));
+      }, WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS);
+    });
+    const disposalPromise = new Promise<never>((_resolve, reject) => {
+      const rejectForDisposal = () => {
+        outcome = "expired";
+        reject(signal.reason);
+      };
+      if (signal.aborted) {
+        rejectForDisposal();
+        return;
+      }
+      signal.addEventListener("abort", rejectForDisposal, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", rejectForDisposal);
+    });
+
+    try {
+      const subscription = await Promise.race([
+        subscriptionPromise,
+        timeoutPromise,
+        disposalPromise,
+      ]);
+      if (signal.aborted) {
+        outcome = "expired";
+        if (!shouldAbandonSubscription()) {
+          unsubscribePromise ??= this.unsubscribeWatcherSubscription(subscription, watchPath);
+          await unsubscribePromise;
+        }
+        throw signal.reason;
+      }
+      outcome = "accepted";
+      return subscription;
+    } finally {
+      if (outcome === "pending") {
+        outcome = "expired";
+      }
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      removeAbortListener();
+    }
+  }
+
+  private async unsubscribeWatcherSubscription(
+    subscription: parcelWatcher.AsyncSubscription,
+    watchPath: string,
+  ): Promise<void> {
+    try {
+      await subscription.unsubscribe();
+    } catch (error) {
+      this.logger.warn({ err: error, watchPath }, "Failed to stop watcher subscription");
+    }
+  }
+
+  private async startWorkingTreeSubscription(
+    target: WorkingTreeWatchTarget,
+    options?: { replaceFallback?: boolean },
+  ): Promise<boolean> {
+    const ignore = [join(target.watchPath, ".git"), ...target.ignoredDirectories];
+    let watcherErrored = false;
+    let subscribeSettled = false;
+    const markSubscribeSettled = () => {
+      subscribeSettled = true;
+      if (watcherErrored) {
+        this.scheduleWorkingTreeWatchRecovery(target);
+      }
+    };
+    try {
+      const subscription = await this.subscribeWithDeadline(
+        target.watchPath,
+        (error, events) => {
+          if (error) {
+            if (watcherErrored) {
+              return;
+            }
+            watcherErrored = true;
+            this.watcherErrorCallbackCount += 1;
+            this.logger.warn(
+              { err: error, cwd: target.cwd },
+              "Working tree watcher error; using degraded polling",
+            );
+            this.degradeWorkingTreeWatch(target, "watcher_error");
+            if (subscribeSettled) {
+              this.scheduleWorkingTreeWatchRecovery(target);
+            }
+            return;
+          }
+          if (watcherErrored) {
+            return;
+          }
+          if (!this.hasRelevantWorkingTreeEvent(target, events)) {
+            return;
+          }
+          this.notifyWorkingTreeChanged(target, "working-tree-watch");
+        },
+        { ignore },
+        markSubscribeSettled,
+        () => watcherErrored,
+      );
+      if (watcherErrored) {
+        return false;
+      }
+      if (
+        target.closed ||
+        (target.fallbackPolling && !options?.replaceFallback) ||
+        target.subscription
+      ) {
+        await this.unsubscribeWatcherSubscription(subscription, target.watchPath);
+        return false;
+      }
+      target.subscription = subscription;
+      if (options?.replaceFallback && target.repoRoot !== null) {
+        target.fallbackPolling = false;
+        if (target.fallbackPollTimer) {
+          clearTimeout(target.fallbackPollTimer);
+          target.fallbackPollTimer = null;
+        }
+      }
+      return true;
+    } catch (error) {
+      if (watcherErrored) {
+        return false;
+      }
+      if (this.disposed || target.closed) {
+        throw error;
+      }
+      this.logger.warn(
+        { err: error, cwd: target.cwd },
+        "Failed to start working tree watcher; using degraded polling",
+      );
+      if (!options?.replaceFallback) {
+        this.startWorkingTreeWatchFallback(target, "watcher_setup_failed");
+      }
+      return false;
+    }
+  }
+
+  private startWorkingTreeWatchFallback(
+    target: WorkingTreeWatchTarget,
+    reason: WorkingTreeWatchFallbackReason,
+  ): void {
+    if (this.disposed || target.closed || target.fallbackPolling) {
+      return;
+    }
+    target.fallbackPolling = true;
+    const { cwd } = target;
+    const poll = async () => {
+      target.fallbackPollTimer = null;
+      if (target.closed || this.workingTreeWatchTargets.get(target.cwd) !== target) {
+        return;
+      }
+      await Promise.all(
+        Array.from(target.workspaceKeys, async (workspaceKey) => {
+          const workspaceTarget = this.workspaceTargets.get(workspaceKey);
+          if (!workspaceTarget) {
+            return;
+          }
+          await this.refreshWorkspaceTarget(workspaceTarget, {
+            force: false,
+            refreshStructure: target.repoRoot === null,
+            refreshWorktree: true,
+            includeForge: false,
+            reason: "working-tree-watch-fallback",
+            notify: true,
+            queueIfBusy: true,
+            movedRemoteRefs: new Set(),
+          });
+          if (target.repoRoot === null && workspaceTarget.latestGit?.isGit === true) {
+            workspaceTarget.observationSetupComplete = false;
+            this.scheduleWorkspaceObservationSetup(workspaceTarget);
+          }
+        }),
+      );
+      this.notifyWorkingTreeConsumers(target);
+      if (!target.closed && (target.subscription === null || target.repoRoot === null)) {
+        target.fallbackPollTimer = setTimeout(poll, DEGRADED_GIT_POLL_INTERVAL_MS);
+      } else {
+        target.fallbackPolling = false;
+      }
+    };
+    target.fallbackPollTimer = setTimeout(poll, DEGRADED_GIT_POLL_INTERVAL_MS);
+    this.logger.warn(
+      {
+        cwd,
+        intervalMs: DEGRADED_GIT_POLL_INTERVAL_MS,
+        reason,
+      },
+      "Working tree watcher unavailable; using bounded polling fallback",
+    );
+  }
+
+  private degradeWorkingTreeWatch(target: WorkingTreeWatchTarget, reason: "watcher_error"): void {
+    // COMPAT(parcel-watcher-eintr): added in v0.3.0, remove after 2027-02-09. Unsubscribing an
+    // errored subscription races native teardown and can strand the Node main thread in
+    // InotifyBackend::~InotifyBackend(): https://github.com/parcel-bundler/watcher/issues/253
+    target.subscription = null;
+    this.notifyWorkingTreeChanged(target, "working-tree-watch-error");
+    this.startWorkingTreeWatchFallback(target, reason);
+  }
+
+  private scheduleWorkingTreeWatchRecovery(target: WorkingTreeWatchTarget): void {
+    if (
+      target.closed ||
+      target.subscription ||
+      target.recovery.timer ||
+      target.recovery.attemptCount >= WATCH_RECOVERY_MAX_ATTEMPTS
+    ) {
+      return;
+    }
+    target.recovery.attemptCount += 1;
+    const delayMs = WATCH_RECOVERY_BASE_DELAY_MS * 2 ** (target.recovery.attemptCount - 1);
+    target.recovery.timer = setTimeout(() => {
+      target.recovery.timer = null;
+      void this.recoverWorkingTreeWatch(target);
+    }, delayMs);
+  }
+
+  private async recoverWorkingTreeWatch(target: WorkingTreeWatchTarget): Promise<void> {
+    if (target.closed || target.subscription) {
+      return;
+    }
+    const recovered = await this.startWorkingTreeSubscription(target, { replaceFallback: true });
+    if (!recovered) {
+      this.scheduleWorkingTreeWatchRecovery(target);
+      return;
+    }
+    this.logger.info({ cwd: target.cwd }, "Working tree watcher recovered");
+    this.notifyWorkingTreeChanged(target, "working-tree-watch-recovered");
+  }
+
+  private async promoteWorkingTreeWatchTarget(
+    target: WorkingTreeWatchTarget,
+    repoRoot: string,
+  ): Promise<void> {
+    if (target.repoRoot !== null) {
+      return;
+    }
+    target.repoRoot = repoRoot;
+    if (target.subscription && target.fallbackPolling) {
+      target.fallbackPolling = false;
+      if (target.fallbackPollTimer) {
+        clearTimeout(target.fallbackPollTimer);
+        target.fallbackPollTimer = null;
+      }
+    }
+    await this.refreshWorkingTreeIgnoredDirectories(target);
+  }
+
+  private hasRelevantWorkingTreeEvent(
+    target: WorkingTreeWatchTarget,
+    events: parcelWatcher.Event[],
+  ): boolean {
+    const gitDir = join(target.watchPath, ".git");
+    const matchesWatchPath = createRealpathAwarePathMatcher(target.watchPath);
+    return events.some((event) => {
+      // Directory metadata changes at the watch root do not change Git state.
+      // FSEvents may emit these when every changed descendant was ignored.
+      if (matchesWatchPath(event.path)) {
+        return false;
+      }
+      if (isRealpathInsideRoot(gitDir, event.path)) {
+        return false;
+      }
+      for (const ignoredDirectory of target.ignoredDirectories) {
+        if (isRealpathInsideRoot(ignoredDirectory, event.path)) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  private refreshWorkingTreeIgnoredDirectories(target: WorkingTreeWatchTarget): Promise<void> {
+    if (target.closed || target.repoRoot === null || target.fallbackPolling) {
+      return Promise.resolve();
+    }
+    if (target.ignoredDirectoriesRefreshPromise) {
+      return target.ignoredDirectoriesRefreshPromise;
+    }
+
+    const refreshPromise = this.replaceWorkingTreeIgnoredDirectories(target)
+      .catch((error) => {
+        this.logger.warn(
+          { err: error, cwd: target.cwd },
+          "Failed to refresh working tree watcher ignore paths",
+        );
+      })
+      .finally(() => {
+        if (target.ignoredDirectoriesRefreshPromise === refreshPromise) {
+          target.ignoredDirectoriesRefreshPromise = null;
+        }
+      });
+    target.ignoredDirectoriesRefreshPromise = refreshPromise;
+    return refreshPromise;
+  }
+
+  private async replaceWorkingTreeIgnoredDirectories(
+    target: WorkingTreeWatchTarget,
+  ): Promise<void> {
+    const ignoredDirectories = await this.loadIgnoredDirs(target.watchPath);
+    if (
+      target.closed ||
+      target.fallbackPolling ||
+      this.haveSamePaths(target.ignoredDirectories, ignoredDirectories)
+    ) {
+      return;
+    }
+
+    const removedIgnoredDirectory = Array.from(target.ignoredDirectories).some(
+      (path) => !ignoredDirectories.has(path),
+    );
+    target.ignoredDirectories = ignoredDirectories;
+    if (!removedIgnoredDirectory) {
+      return;
+    }
+
+    const subscription = target.subscription;
+    if (subscription) {
+      target.subscription = null;
+      try {
+        await subscription.unsubscribe();
+      } catch (error) {
+        if (!target.closed && !target.fallbackPolling) {
+          this.startWorkingTreeWatchFallback(target, "watcher_teardown_failed");
+        }
+        this.logger.warn(
+          { err: error, cwd: target.cwd },
+          "Failed to stop working tree watcher while refreshing ignore paths",
+        );
+        return;
+      }
+    }
+    if (target.closed || target.fallbackPolling) {
+      return;
+    }
+
+    await this.startWorkingTreeSubscription(target);
+    this.notifyWorkingTreeChanged(target, "working-tree-watch-reconfigured");
+  }
+
+  private haveSamePaths(first: Set<string>, second: Set<string>): boolean {
+    if (first.size !== second.size) {
+      return false;
+    }
+    for (const path of first) {
+      if (!second.has(path)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private notifyWorkingTreeChanged(target: WorkingTreeWatchTarget, reason: string): void {
+    if (target.closed) {
+      return;
+    }
+    this.notifyWorkingTreeConsumers(target);
+    this.scheduleWorkingTreeRefreshes(target, reason);
+  }
+
+  private notifyWorkingTreeConsumers(target: WorkingTreeWatchTarget): void {
+    for (const alias of target.aliases) {
+      this.invalidateCheckoutDiffCache(alias, "uncommitted");
+    }
+    for (const listener of target.listeners) {
+      listener();
+    }
+  }
+
+  private scheduleWorkingTreeRefreshes(target: WorkingTreeWatchTarget, reason: string): void {
+    for (const workspaceKey of target.workspaceKeys) {
+      const workspaceTarget = this.workspaceTargets.get(workspaceKey);
+      if (workspaceTarget) {
+        this.scheduleWorkspaceRefresh(workspaceTarget, { scope: "worktree", reason });
+      }
+    }
+  }
+
+  private getWorkingTreeWatchTargetForWorkspace(
+    workspaceTarget: WorkspaceGitTarget,
+  ): WorkingTreeWatchTarget | null {
+    const target = workspaceTarget.workingTreeWatchTarget;
+    return target && !target.closed ? target : null;
   }
 
   private async resolveCheckoutWatchRoot(cwd: string): Promise<string | null> {
@@ -1115,35 +1766,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return gitDir;
   }
 
-  private startWorkspaceWatchers(
-    target: WorkspaceGitTarget,
-    gitDir: string,
-    repoGitRoot: string,
-  ): void {
-    for (const watchPath of new Set([join(gitDir, "HEAD"), join(repoGitRoot, "refs", "heads")])) {
-      let watcher: FSWatcher | null = null;
-      try {
-        watcher = this.deps.watch(watchPath, { recursive: false }, () => {
-          this.scheduleWorkspaceRefresh(target);
-        });
-      } catch (error) {
-        this.logger.warn(
-          { err: error, cwd: target.cwd, watchPath },
-          "Failed to start workspace git watcher",
-        );
-      }
-
-      if (!watcher) {
-        continue;
-      }
-
-      watcher.on("error", (error) => {
-        this.logger.warn({ err: error, cwd: target.cwd, watchPath }, "Workspace git watcher error");
-      });
-      target.watchers.push(watcher);
-    }
-  }
-
   private async ensureRepoTarget(workspaceTarget: WorkspaceGitTarget): Promise<void> {
     const repoGitRoot = workspaceTarget.repoGitRoot;
     if (!repoGitRoot || !this.isActiveObservedWorkspaceTarget(workspaceTarget)) {
@@ -1156,35 +1778,509 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return;
     }
 
-    const facts = workspaceTarget.latestFacts;
+    const repoTarget: RepoGitTarget = {
+      repoGitRoot,
+      cwd: workspaceTarget.cwd,
+      workspaceKeys: new Set([workspaceTarget.cwd]),
+      subscription: null,
+      fallbackPolling: false,
+      fallbackPollTimer: null,
+      recovery: { attemptCount: 0, timer: null },
+      intervalId: null,
+      fetchInFlight: false,
+      bufferedFetchMetadataEvents: [],
+      recentFetchRemoteRefChanges: new Map(),
+      knownRemoteRefs: null,
+      closed: false,
+    };
+    this.repoTargets.set(repoGitRoot, repoTarget);
+    await this.startRepoMetadataObservation(repoTarget);
+    if (repoTarget.closed || this.repoTargets.get(repoGitRoot) !== repoTarget) {
+      return;
+    }
+
+    const fetchWorkspaceTarget = Array.from(repoTarget.workspaceKeys)
+      .map((workspaceKey) => this.workspaceTargets.get(workspaceKey))
+      .find(
+        (candidate): candidate is WorkspaceGitTarget =>
+          candidate !== undefined && this.isActiveObservedWorkspaceTarget(candidate),
+      );
+    if (!fetchWorkspaceTarget) {
+      return;
+    }
+    repoTarget.cwd = fetchWorkspaceTarget.cwd;
+    const facts = fetchWorkspaceTarget.latestFacts;
     const hasOrigin =
       facts?.isGit === true
         ? facts.remoteUrl !== null
-        : await this.deps.hasOriginRemote(workspaceTarget.cwd);
-    if (!this.isActiveObservedWorkspaceTarget(workspaceTarget)) {
+        : await this.deps.hasOriginRemote(fetchWorkspaceTarget.cwd);
+    if (repoTarget.closed || this.repoTargets.get(repoGitRoot) !== repoTarget) {
       return;
     }
     if (!hasOrigin) {
       return;
     }
+    repoTarget.intervalId = setInterval(() => {
+      void this.runRepoFetch(repoTarget);
+    }, BACKGROUND_GIT_FETCH_INTERVAL_MS);
+    void this.runRepoFetch(repoTarget);
+  }
 
-    const targetAfterProbe = this.repoTargets.get(repoGitRoot);
-    if (targetAfterProbe) {
-      targetAfterProbe.workspaceKeys.add(workspaceTarget.cwd);
+  private async startRepoMetadataObservation(
+    target: RepoGitTarget,
+    options?: { replaceFallback?: boolean },
+  ): Promise<boolean> {
+    const ignore = getPrunedGitMetadataPaths("common").map((path) =>
+      join(target.repoGitRoot, path),
+    );
+    const matchesRepoGitRoot = createRealpathAwarePathMatcher(target.repoGitRoot);
+    let watcherErrored = false;
+    let subscribeSettled = false;
+    const markSubscribeSettled = () => {
+      subscribeSettled = true;
+      if (watcherErrored) {
+        this.scheduleRepoMetadataWatchRecovery(target);
+      }
+    };
+    try {
+      const subscription = await this.subscribeWithDeadline(
+        target.repoGitRoot,
+        (error, events) => {
+          if (error) {
+            if (watcherErrored) {
+              return;
+            }
+            watcherErrored = true;
+            this.watcherErrorCallbackCount += 1;
+            this.logger.warn(
+              { err: error, repoGitRoot: target.repoGitRoot },
+              "Repository metadata watcher error; using degraded polling",
+            );
+            this.degradeRepoMetadataWatch(target);
+            if (subscribeSettled) {
+              this.scheduleRepoMetadataWatchRecovery(target);
+            }
+            return;
+          }
+          if (watcherErrored) {
+            return;
+          }
+          const relevantEvents = events.filter(
+            (event) =>
+              !matchesRepoGitRoot(event.path) &&
+              ignore.every((ignoredPath) => !isRealpathInsideRoot(ignoredPath, event.path)),
+          );
+          if (relevantEvents.length > 0) {
+            const immediateEvents = target.fetchInFlight
+              ? relevantEvents.filter((event) => {
+                  if (this.isFetchRemoteMetadataEvent(target, event)) {
+                    target.bufferedFetchMetadataEvents.push(event);
+                    return false;
+                  }
+                  return true;
+                })
+              : relevantEvents;
+            if (immediateEvents.length > 0) {
+              const routedRefreshes = this.routeRepoMetadataEvents(target, immediateEvents);
+              this.scheduleRepoMetadataRefresh(
+                target,
+                "git-metadata-watch",
+                routedRefreshes === null || [...routedRefreshes.values()].some((r) => r.structural),
+                routedRefreshes,
+              );
+            }
+          }
+        },
+        { ignore },
+        markSubscribeSettled,
+        () => watcherErrored,
+      );
+      if (watcherErrored) {
+        return false;
+      }
+      if (
+        target.closed ||
+        (target.fallbackPolling && !options?.replaceFallback) ||
+        this.repoTargets.get(target.repoGitRoot) !== target
+      ) {
+        await this.unsubscribeWatcherSubscription(subscription, target.repoGitRoot);
+        return false;
+      }
+      target.subscription = subscription;
+      if (options?.replaceFallback) {
+        target.fallbackPolling = false;
+        if (target.fallbackPollTimer) {
+          clearTimeout(target.fallbackPollTimer);
+          target.fallbackPollTimer = null;
+        }
+      }
+      return true;
+    } catch (error) {
+      if (watcherErrored) {
+        return false;
+      }
+      if (this.disposed || target.closed) {
+        throw error;
+      }
+      this.logger.warn(
+        { err: error, repoGitRoot: target.repoGitRoot },
+        "Failed to start repository metadata watcher; using degraded polling",
+      );
+      if (!options?.replaceFallback) {
+        this.startRepoMetadataFallback(target);
+      }
+      return false;
+    }
+  }
+
+  private degradeRepoMetadataWatch(target: RepoGitTarget): void {
+    // COMPAT(parcel-watcher-eintr): added in v0.3.0, remove after 2027-02-09. See
+    // degradeWorkingTreeWatch for why this errored subscription must be abandoned.
+    target.subscription = null;
+    this.scheduleRepoMetadataRefresh(target, "git-metadata-watch-error", true);
+    this.startRepoMetadataFallback(target);
+  }
+
+  private scheduleRepoMetadataWatchRecovery(target: RepoGitTarget): void {
+    if (
+      target.closed ||
+      target.subscription ||
+      target.recovery.timer ||
+      target.recovery.attemptCount >= WATCH_RECOVERY_MAX_ATTEMPTS
+    ) {
       return;
     }
+    target.recovery.attemptCount += 1;
+    const delayMs = WATCH_RECOVERY_BASE_DELAY_MS * 2 ** (target.recovery.attemptCount - 1);
+    target.recovery.timer = setTimeout(() => {
+      target.recovery.timer = null;
+      void this.recoverRepoMetadataWatch(target);
+    }, delayMs);
+  }
 
-    const repoTarget: RepoGitTarget = {
-      repoGitRoot,
-      cwd: workspaceTarget.cwd,
-      workspaceKeys: new Set([workspaceTarget.cwd]),
-      intervalId: setInterval(() => {
-        void this.runRepoFetch(repoTarget);
-      }, BACKGROUND_GIT_FETCH_INTERVAL_MS),
-      fetchInFlight: false,
+  private async recoverRepoMetadataWatch(target: RepoGitTarget): Promise<void> {
+    if (target.closed || target.subscription) {
+      return;
+    }
+    const recovered = await this.startRepoMetadataObservation(target, { replaceFallback: true });
+    if (!recovered) {
+      this.scheduleRepoMetadataWatchRecovery(target);
+      return;
+    }
+    this.logger.info({ repoGitRoot: target.repoGitRoot }, "Repository metadata watcher recovered");
+  }
+
+  private routeRepoMetadataEvents(
+    target: RepoGitTarget,
+    events: parcelWatcher.Event[],
+  ): Map<string, RepoMetadataWorkspaceRefresh> | null {
+    const refreshes = new Map<string, RepoMetadataWorkspaceRefresh>();
+    const matchesRepoGitRoot = createRealpathAwarePathMatcher(target.repoGitRoot);
+
+    for (const event of events) {
+      if (!this.routeRepoMetadataEvent(target, event, matchesRepoGitRoot, refreshes)) return null;
+    }
+
+    return refreshes;
+  }
+
+  private isFetchRemoteMetadataEvent(target: RepoGitTarget, event: parcelWatcher.Event): boolean {
+    const relativePath = getRealpathAwareRelativePath(target.repoGitRoot, event.path);
+    const effect = classifyGitMetadataPath("common", relativePath ?? "");
+    return (
+      (effect.kind === "ref" && effect.namespace === "remote") ||
+      (effect.kind === "all" &&
+        (relativePath === "packed-refs" || relativePath?.startsWith("reftable/") === true))
+    );
+  }
+
+  private routeRepoMetadataEvent(
+    target: RepoGitTarget,
+    event: parcelWatcher.Event,
+    matchesRepoGitRoot: ReturnType<typeof createRealpathAwarePathMatcher>,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+  ): boolean {
+    if (this.routePrivateGitDirEvent(target, event, matchesRepoGitRoot, refreshes)) return true;
+
+    const commonRelativePath = getRealpathAwareRelativePath(target.repoGitRoot, event.path);
+    const effect = classifyGitMetadataPath("common", commonRelativePath ?? "");
+    switch (effect.kind) {
+      case "ignore":
+        return true;
+      case "owner":
+        this.routeMainCheckoutMetadata(target, matchesRepoGitRoot, effect.refreshBase, refreshes);
+        return true;
+      case "ref":
+        if (effect.namespace === "local") {
+          this.routeLocalBranchRef(target, effect.ref, refreshes);
+        } else {
+          if (event.type === "delete") {
+            target.recentFetchRemoteRefChanges.delete(effect.ref);
+            target.knownRemoteRefs = null;
+            return false;
+          }
+          const recent = target.recentFetchRemoteRefChanges.get(effect.ref);
+          if (recent && recent.expiresAtMs >= this.deps.now().getTime()) {
+            this.routeRemoteBranchRef(target, effect.ref, refreshes, {
+              narrow: recent.change.kind === "moved",
+            });
+          } else {
+            target.recentFetchRemoteRefChanges.delete(effect.ref);
+            if (target.knownRemoteRefs?.has(effect.ref)) {
+              this.routeRemoteBranchRef(target, effect.ref, refreshes, { narrow: true });
+            } else if (
+              event.type === "create" &&
+              target.knownRemoteRefs &&
+              [...target.knownRemoteRefs].some((ref) => ref.startsWith(`${effect.ref}/`))
+            ) {
+              return true;
+            } else {
+              return false;
+            }
+          }
+        }
+        return true;
+      case "all":
+        if (
+          commonRelativePath === "packed-refs" ||
+          commonRelativePath?.startsWith("reftable/") === true
+        ) {
+          target.knownRemoteRefs = null;
+        }
+        return false;
+    }
+  }
+
+  private routePrivateGitDirEvent(
+    target: RepoGitTarget,
+    event: parcelWatcher.Event,
+    matchesRepoGitRoot: ReturnType<typeof createRealpathAwarePathMatcher>,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+  ): boolean {
+    let matched = false;
+    for (const workspaceKey of target.workspaceKeys) {
+      const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
+      if (!facts?.isGit || !facts.absoluteGitDir || matchesRepoGitRoot(facts.absoluteGitDir)) {
+        continue;
+      }
+      const relativePath = getRealpathAwareRelativePath(facts.absoluteGitDir, event.path);
+      if (relativePath === null) continue;
+      matched = true;
+      const effect = classifyGitMetadataPath("worktree", relativePath);
+      if (effect.kind === "owner") {
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, effect.refreshBase);
+      } else if (effect.kind !== "ignore") {
+        throw new Error(`Invalid ${effect.kind} effect for worktree metadata`);
+      }
+    }
+    return matched;
+  }
+
+  private routeMainCheckoutMetadata(
+    target: RepoGitTarget,
+    matchesRepoGitRoot: ReturnType<typeof createRealpathAwarePathMatcher>,
+    refreshBase: boolean,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+  ): void {
+    for (const workspaceKey of target.workspaceKeys) {
+      const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
+      if (facts?.isGit && facts.absoluteGitDir && matchesRepoGitRoot(facts.absoluteGitDir)) {
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, refreshBase);
+      }
+    }
+  }
+
+  private routeLocalBranchRef(
+    target: RepoGitTarget,
+    branch: string,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+  ): void {
+    for (const workspaceKey of target.workspaceKeys) {
+      const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
+      if (!facts?.isGit) continue;
+      const dependentRefs = [
+        facts.storedBaseRef,
+        facts.resolvedBaseRef,
+        facts.comparisonBaseRef,
+        facts.upstreamStatus?.ref,
+      ];
+      const usesBranch = dependentRefs.some(
+        (ref) => ref === branch || ref === `refs/heads/${branch}`,
+      );
+      if (facts.currentBranch === branch || usesBranch) {
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, true);
+      }
+    }
+  }
+
+  private routeRemoteBranchRef(
+    target: RepoGitTarget,
+    remoteRef: string,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+    options?: { narrow?: boolean; queueIfBusy?: boolean },
+  ): void {
+    const qualifiedRemoteRef = `refs/remotes/${remoteRef}`;
+    for (const workspaceKey of target.workspaceKeys) {
+      const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
+      if (!facts?.isGit) continue;
+      const trackedBranch = facts.branchMergeRef?.startsWith("refs/heads/")
+        ? facts.branchMergeRef.slice("refs/heads/".length)
+        : null;
+      const configuredRemoteRef =
+        facts.branchRemoteName && facts.branchRemoteName !== "." && trackedBranch
+          ? `${facts.branchRemoteName}/${trackedBranch}`
+          : null;
+      const shortstatRemoteRef =
+        facts.currentBranch &&
+        (!facts.resolvedBaseRef || branchNameFromRef(facts.resolvedBaseRef) === facts.currentBranch)
+          ? `origin/${facts.currentBranch}`
+          : null;
+      const refs = [
+        facts.storedBaseRef,
+        facts.resolvedBaseRef,
+        facts.comparisonBaseRef,
+        facts.upstreamStatus?.ref,
+        configuredRemoteRef,
+        shortstatRemoteRef,
+      ];
+      const usesRemoteRef = refs.some((ref) => ref === remoteRef || ref === qualifiedRemoteRef);
+      if (usesRemoteRef) {
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, true, {
+          structural: options?.narrow !== true,
+          movedRemoteRef: options?.narrow === true ? remoteRef : undefined,
+          queueIfBusy: options?.queueIfBusy,
+        });
+      }
+    }
+  }
+
+  private addWorkspaceMetadataRefresh(
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+    workspaceKey: string,
+    refreshBase: boolean,
+    options?: {
+      structural?: boolean;
+      movedRemoteRef?: string;
+      queueIfBusy?: boolean;
+    },
+  ): void {
+    const previous = refreshes.get(workspaceKey);
+    const movedRemoteRefs = new Set(previous?.movedRemoteRefs);
+    if (options?.movedRemoteRef) {
+      movedRemoteRefs.add(options.movedRemoteRef);
+    }
+    refreshes.set(workspaceKey, {
+      refreshBase: previous?.refreshBase === true || refreshBase,
+      structural: previous?.structural === true || options?.structural !== false,
+      movedRemoteRefs,
+      queueIfBusy: (previous?.queueIfBusy ?? false) || (options?.queueIfBusy ?? true),
+    });
+  }
+
+  private scheduleRepoMetadataRefresh(
+    target: RepoGitTarget,
+    reason: string,
+    refreshWorktree: boolean,
+    routedRefreshes: Map<string, RepoMetadataWorkspaceRefresh> | null = null,
+  ): void {
+    if (target.closed || this.repoTargets.get(target.repoGitRoot) !== target) {
+      return;
+    }
+    const workingTreeTargets = new Set<WorkingTreeWatchTarget>();
+    const refreshes =
+      routedRefreshes ??
+      new Map(
+        Array.from(target.workspaceKeys, (workspaceKey) => [
+          workspaceKey,
+          {
+            refreshBase: true,
+            structural: true,
+            movedRemoteRefs: new Set<string>(),
+            queueIfBusy: true,
+          },
+        ]),
+      );
+    for (const [workspaceKey, refresh] of refreshes) {
+      const workspaceTarget = this.workspaceTargets.get(workspaceKey);
+      if (workspaceTarget) {
+        let scope: ScheduledWorkspaceGitRefreshOptions["scope"];
+        if (!refreshWorktree) {
+          scope = refresh.structural ? "structure" : "refs";
+        }
+        if (refresh.refreshBase) {
+          this.invalidateCheckoutDiffCache(workspaceTarget.cwd, "base");
+          if (workspaceTarget.latestFacts?.isGit) {
+            this.invalidateCheckoutDiffCache(workspaceTarget.latestFacts.worktreeRoot, "base");
+          }
+        }
+        if (refreshWorktree) {
+          const workingTreeTarget = this.getWorkingTreeWatchTargetForWorkspace(workspaceTarget);
+          if (workingTreeTarget) {
+            workingTreeTargets.add(workingTreeTarget);
+          }
+        }
+        this.scheduleWorkspaceRefresh(workspaceTarget, {
+          scope,
+          emitUnchanged: refresh.refreshBase,
+          reason,
+          queueIfBusy: refresh.queueIfBusy,
+          movedRemoteRefs: refresh.movedRemoteRefs,
+        });
+      }
+    }
+    for (const workingTreeTarget of workingTreeTargets) {
+      this.notifyWorkingTreeConsumers(workingTreeTarget);
+    }
+  }
+
+  private startRepoMetadataFallback(target: RepoGitTarget): void {
+    if (target.fallbackPolling || target.closed) {
+      return;
+    }
+    target.fallbackPolling = true;
+    const poll = async () => {
+      target.fallbackPollTimer = null;
+      if (target.closed || this.repoTargets.get(target.repoGitRoot) !== target) {
+        return;
+      }
+      const workingTreeTargets = new Set<WorkingTreeWatchTarget>();
+      await Promise.all(
+        Array.from(target.workspaceKeys, async (workspaceKey) => {
+          const workspaceTarget = this.workspaceTargets.get(workspaceKey);
+          if (!workspaceTarget) {
+            return;
+          }
+          this.invalidateCheckoutDiffCache(workspaceTarget.cwd, "base");
+          if (workspaceTarget.latestFacts?.isGit) {
+            this.invalidateCheckoutDiffCache(workspaceTarget.latestFacts.worktreeRoot, "base");
+          }
+          const workingTreeTarget = this.getWorkingTreeWatchTargetForWorkspace(workspaceTarget);
+          if (workingTreeTarget) {
+            workingTreeTargets.add(workingTreeTarget);
+          }
+          await this.refreshWorkspaceTarget(workspaceTarget, {
+            force: false,
+            refreshStructure: true,
+            refreshWorktree: true,
+            includeForge: false,
+            emitUnchanged: true,
+            reason: "git-metadata-watch-fallback",
+            notify: true,
+            queueIfBusy: true,
+            movedRemoteRefs: new Set(),
+          });
+        }),
+      );
+      for (const workingTreeTarget of workingTreeTargets) {
+        this.notifyWorkingTreeConsumers(workingTreeTarget);
+      }
+      if (!target.closed && target.subscription === null) {
+        target.fallbackPollTimer = setTimeout(poll, DEGRADED_GIT_POLL_INTERVAL_MS);
+      } else {
+        target.fallbackPolling = false;
+      }
     };
-    this.repoTargets.set(repoGitRoot, repoTarget);
-    void this.runRepoFetch(repoTarget);
+    target.fallbackPollTimer = setTimeout(poll, DEGRADED_GIT_POLL_INTERVAL_MS);
   }
 
   private scheduleWorkspaceRefresh(
@@ -1224,20 +2320,58 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   private startWorkspaceSubscriptionTimers(target: WorkspaceGitTarget): void {
     if (!target.selfHealTimer) {
-      target.selfHealTimer = setInterval(() => {
+      target.auditWindowStartedAtMs = this.deps.now().getTime();
+      const runSelfHealTick = () => {
+        if (!this.isActiveObservedWorkspaceTarget(target)) {
+          target.selfHealTimer = null;
+          return;
+        }
+        target.selfHealTimer = setTimeout(runSelfHealTick, WORKSPACE_GIT_SELF_HEAL_INTERVAL_MS);
         this.scheduleWorkspaceObservationSetup(target);
+        const auditWindowStartedAtMs = target.auditWindowStartedAtMs;
+        target.auditWindowStartedAtMs = this.deps.now().getTime();
+        if (auditWindowStartedAtMs === null) {
+          return;
+        }
+        const workingTreeTarget = this.getWorkingTreeWatchTargetForWorkspace(target);
+        if (workingTreeTarget) {
+          void this.refreshWorkingTreeIgnoredDirectories(workingTreeTarget);
+        }
+        const refreshStructure =
+          target.latestStructuralRefreshAtMs === null ||
+          target.latestStructuralRefreshAtMs < auditWindowStartedAtMs;
+        const refreshWorktree =
+          refreshStructure ||
+          target.latestWorktreeRefreshAtMs === null ||
+          target.latestWorktreeRefreshAtMs < auditWindowStartedAtMs;
+        if (!refreshStructure && !refreshWorktree) {
+          return;
+        }
+        if (refreshWorktree) {
+          if (workingTreeTarget) {
+            this.notifyWorkingTreeConsumers(workingTreeTarget);
+          }
+        }
         this.refreshWorkspaceTarget(target, {
           force: false,
+          refreshStructure,
+          refreshWorktree,
           includeForge: false,
           reason: "self-heal-git",
           notify: true,
+          queueIfBusy: true,
+          movedRemoteRefs: new Set(),
         }).catch((error) => {
           this.logger.warn(
             { err: error, cwd: target.cwd, reason: "self-heal-git" },
             "Failed to run workspace git self-heal refresh",
           );
         });
-      }, WORKSPACE_GIT_SELF_HEAL_INTERVAL_MS);
+      };
+      target.selfHealTimer = setTimeout(
+        runSelfHealTick,
+        this.deps.getWorkspaceGitSelfHealPhaseMs(target.cwd),
+      );
     }
 
     this.updateForgePrStatusPollForTarget(target);
@@ -1436,184 +2570,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target.forgePrStatusPollKey = null;
   }
 
-  private addWorkingTreeWatcher(
-    target: WorkingTreeWatchTarget,
-    watchPath: string,
-    shouldTryRecursive: boolean,
-  ): boolean {
-    if (target.watchedPaths.has(watchPath)) {
-      return false;
-    }
-
-    const { cwd } = target;
-    const onChange = () => {
-      if (process.platform === "linux" && target.repoWatchPath) {
-        void this.refreshLinuxRepoTreeWatchers(target);
-      }
-      this.scheduleWorkspaceRefresh(cwd, {
-        force: true,
-        reason: "working-tree-watch",
-      });
-      for (const listener of target.listeners) {
-        listener();
-      }
-    };
-    const createWatcher = (recursive: boolean): FSWatcher =>
-      this.deps.watch(watchPath, { recursive }, () => {
-        onChange();
-      });
-
-    let watcher: FSWatcher | null = null;
-    let watcherIsRecursive = false;
-    try {
-      if (shouldTryRecursive) {
-        watcher = createWatcher(true);
-        watcherIsRecursive = true;
-      } else {
-        watcher = createWatcher(false);
-      }
-    } catch (error) {
-      if (shouldTryRecursive) {
-        try {
-          watcher = createWatcher(false);
-          this.logger.warn(
-            { err: error, watchPath, cwd },
-            "Working tree recursive watch unavailable; using non-recursive fallback",
-          );
-        } catch (fallbackError) {
-          this.logger.warn(
-            { err: fallbackError, watchPath, cwd },
-            "Failed to start working tree watcher",
-          );
-        }
-      } else {
-        this.logger.warn({ err: error, watchPath, cwd }, "Failed to start working tree watcher");
-      }
-    }
-
-    if (!watcher) {
-      return false;
-    }
-
-    watcher.on("error", (error) => {
-      this.logger.warn({ err: error, watchPath, cwd }, "Working tree watcher error");
-    });
-    target.watchers.push(watcher);
-    target.watchedPaths.add(watchPath);
-    return watcherIsRecursive;
-  }
-
-  private async ensureLinuxRepoTreeWatchers(
-    target: WorkingTreeWatchTarget,
-    rootPath: string,
-  ): Promise<boolean> {
-    const directories = await this.listLinuxWatchDirectories(rootPath);
-    let complete = true;
-    for (const directory of directories) {
-      const watcherWasRecursive = this.addWorkingTreeWatcher(target, directory, false);
-      if (!watcherWasRecursive && !target.watchedPaths.has(directory)) {
-        complete = false;
-      }
-    }
-    return complete && target.watchedPaths.has(rootPath);
-  }
-
-  private async refreshLinuxRepoTreeWatchers(target: WorkingTreeWatchTarget): Promise<void> {
-    if (process.platform !== "linux" || !target.repoWatchPath) {
-      return;
-    }
-    const rootPath = target.repoWatchPath;
-    if (target.linuxTreeRefreshPromise) {
-      target.linuxTreeRefreshQueued = true;
-      return;
-    }
-
-    target.linuxTreeRefreshPromise = (async () => {
-      do {
-        target.linuxTreeRefreshQueued = false;
-        try {
-          await this.ensureLinuxRepoTreeWatchers(target, rootPath);
-        } catch (error) {
-          this.logger.warn(
-            {
-              err: error,
-              cwd: target.cwd,
-              rootPath,
-            },
-            "Failed to refresh Linux working tree watchers",
-          );
-        }
-        if (target.linuxTreeRefreshQueued) {
-          await new Promise((r) => setTimeout(r, LINUX_WATCH_REFRESH_COOLDOWN_MS));
-        }
-      } while (target.linuxTreeRefreshQueued);
-    })();
-
-    try {
-      await target.linuxTreeRefreshPromise;
-    } finally {
-      target.linuxTreeRefreshPromise = null;
-    }
-  }
-
-  private async listLinuxWatchDirectories(rootPath: string): Promise<string[]> {
-    const ignored = await this.loadLinuxIgnoredDirs(rootPath);
-    const directories: string[] = [];
-    let currentLevel: string[] = [rootPath];
-    let capped = false;
-
-    while (currentLevel.length > 0) {
-      directories.push(...currentLevel);
-      if (directories.length >= LINUX_WATCH_MAX_DIRS) {
-        capped = true;
-        break;
-      }
-      const readResults = await Promise.all(
-        currentLevel.map((directory) =>
-          linuxWatchReaddirLimit(async () => {
-            try {
-              return await this.deps.readdir(directory, { withFileTypes: true });
-            } catch {
-              return null;
-            }
-          }),
-        ),
-      );
-      const nextLevel: string[] = [];
-      for (let i = 0; i < currentLevel.length; i += 1) {
-        const directory = currentLevel[i];
-        const entries = readResults[i];
-        if (!directory || !entries) continue;
-        for (const entry of entries) {
-          if (!entry.isDirectory() || entry.name === ".git") {
-            continue;
-          }
-          const childPath = join(directory, entry.name);
-          if (ignored.has(childPath)) {
-            continue;
-          }
-          nextLevel.push(childPath);
-        }
-      }
-      currentLevel = nextLevel;
-    }
-
-    if (capped) {
-      this.logger.warn(
-        { rootPath, limit: LINUX_WATCH_MAX_DIRS, walked: directories.length },
-        "Linux working tree exceeds watcher cap; skipping deeper directories",
-      );
-    }
-
-    return directories;
-  }
-
-  private async loadLinuxIgnoredDirs(rootPath: string): Promise<Set<string>> {
-    const cached = this.linuxIgnoredDirsCache.get(rootPath);
-    if (cached && Date.now() - cached.ts < LINUX_WATCH_IGNORE_TTL_MS) {
-      return cached.ignored;
-    }
-
+  private async loadIgnoredDirs(rootPath: string): Promise<Set<string>> {
     const ignored = new Set<string>();
     try {
       const result = await this.deps.runGitCommand(
@@ -1637,7 +2594,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       );
     }
 
-    this.linuxIgnoredDirsCache.set(rootPath, { ignored, ts: Date.now() });
     return ignored;
   }
 
@@ -1651,6 +2607,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     try {
       await this.requestWorkspaceSnapshot(target, request);
     } catch (error) {
+      if (this.disposed || target.closed) {
+        return;
+      }
       this.logger.warn(
         { err: error, cwd: target.cwd, reason: request.reason },
         "Failed to refresh workspace git snapshot",
@@ -1663,16 +2622,21 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     request: WorkspaceGitRefreshRequest,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
     if (target.refreshState.status === "in-flight") {
-      const needsForcedRefresh = request.force && !target.refreshState.force;
-      const needsGitHubRefresh =
-        request.force && request.includeForge && !target.refreshState.includeForge;
-      if (needsForcedRefresh || needsGitHubRefresh) {
+      const active = target.refreshState.request;
+      const addsWork =
+        (request.force && !active.force) ||
+        (request.refreshStructure && !active.refreshStructure) ||
+        (request.refreshWorktree && !active.refreshWorktree) ||
+        (request.includeForge && !active.includeForge) ||
+        (request.emitUnchanged === true && active.emitUnchanged !== true) ||
+        [...request.movedRemoteRefs].some((ref) => !active.movedRemoteRefs.has(ref));
+      if (request.queueIfBusy || addsWork) {
         target.refreshState.queued = this.mergeRefreshRequests(target.refreshState.queued, request);
       }
       return target.refreshState.promise;
     }
 
-    if (!request.force && this.shouldThrottleNonForcedRefresh(target)) {
+    if (!request.force && !request.queueIfBusy && this.shouldThrottleNonForcedRefresh(target)) {
       return Promise.resolve(target.latestSnapshot);
     }
 
@@ -1685,8 +2649,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target.refreshState = {
       status: "in-flight",
       promise,
-      force: request.force,
-      includeForge: request.includeForge,
+      request,
       queued: null,
     };
 
@@ -1705,9 +2668,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const force = options?.force === true;
     return {
       force,
+      refreshStructure: true,
+      refreshWorktree: true,
       includeForge: options?.includeForge ?? true,
       reason: options?.reason ?? defaultReason,
       notify,
+      queueIfBusy: false,
+      movedRemoteRefs: new Set(),
     };
   }
 
@@ -1726,11 +2693,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private buildScheduledRefreshRequest(
     options: ScheduledWorkspaceGitRefreshOptions | undefined,
   ): WorkspaceGitRefreshRequest {
+    const scope = options?.scope;
     return {
       force: options?.force === true,
+      refreshStructure: scope !== "worktree" && scope !== "refs",
+      refreshWorktree: scope !== "structure" && scope !== "refs",
       includeForge: options?.includeForge ?? false,
+      emitUnchanged: options?.emitUnchanged,
       reason: options?.reason ?? "watch",
       notify: true,
+      queueIfBusy: options?.queueIfBusy ?? true,
+      movedRemoteRefs: new Set(options?.movedRemoteRefs),
     };
   }
 
@@ -1744,12 +2717,32 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     const force = pending.force || request.force;
     const upgradesForce = request.force && !pending.force;
+    const upgradesStructure = request.refreshStructure && !pending.refreshStructure;
+    const upgradesWorktree = request.refreshWorktree && !pending.refreshWorktree;
     const upgradesForge = request.includeForge && !pending.includeForge;
+    const upgradesEmit = request.emitUnchanged === true && pending.emitUnchanged !== true;
+    const { merged: movedRemoteRefs, added: upgradesMovedRefs } = mergeSets(
+      pending.movedRemoteRefs,
+      request.movedRemoteRefs,
+    );
     return {
       force,
+      refreshStructure: pending.refreshStructure || request.refreshStructure,
+      refreshWorktree: pending.refreshWorktree || request.refreshWorktree,
       includeForge: pending.includeForge || request.includeForge,
-      reason: upgradesForce || upgradesForge ? request.reason : pending.reason,
+      emitUnchanged: pending.emitUnchanged === true || request.emitUnchanged === true,
+      reason:
+        upgradesForce ||
+        upgradesStructure ||
+        upgradesWorktree ||
+        upgradesForge ||
+        upgradesEmit ||
+        upgradesMovedRefs
+          ? request.reason
+          : pending.reason,
       notify: pending.notify || request.notify,
+      queueIfBusy: pending.queueIfBusy || request.queueIfBusy,
+      movedRemoteRefs,
     };
   }
 
@@ -1758,14 +2751,44 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     initialRequest: WorkspaceGitRefreshRequest,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
     let request = initialRequest;
-    let snapshot!: WorkspaceGitRuntimeSnapshot;
+    let snapshot = target.latestSnapshot ?? buildNotGitSnapshot(target.cwd);
+    let failure: { error: unknown } | null = null;
 
     while (true) {
-      snapshot = await this.refreshSnapshot(target, request);
-      this.rememberSnapshot(target, snapshot, {
-        notify: request.notify,
-        forceEmit: request.force,
-      });
+      if (
+        request.emitUnchanged === true &&
+        request.movedRemoteRefs.size === 0 &&
+        target.latestSnapshot
+      ) {
+        this.rememberSnapshot(target, target.latestSnapshot, {
+          notify: request.notify,
+          forceEmit: true,
+        });
+      }
+      try {
+        const admittedSnapshot = await this.workspaceRefreshLimit(() => {
+          if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+            return null;
+          }
+          return this.refreshSnapshot(target, request);
+        });
+        if (!admittedSnapshot) {
+          break;
+        }
+        snapshot = admittedSnapshot;
+        this.rememberSnapshot(target, snapshot, {
+          notify: request.notify,
+          forceEmit:
+            request.force || (request.emitUnchanged === true && request.movedRemoteRefs.size > 0),
+        });
+        failure = null;
+      } catch (error) {
+        failure = { error };
+      }
+
+      if (this.disposed || target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+        break;
+      }
 
       const state = target.refreshState;
       if (state.status !== "in-flight" || !state.queued) {
@@ -1774,10 +2797,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
       request = state.queued;
       state.queued = null;
-      state.force = request.force;
-      state.includeForge = request.includeForge;
+      state.request = request;
     }
 
+    if (failure) {
+      throw failure.error;
+    }
     return snapshot;
   }
 
@@ -1785,7 +2810,34 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target: WorkspaceGitTarget,
     request: WorkspaceGitRefreshRequest,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
-    const facts = await this.refreshGitSnapshot(target, request);
+    let facts = target.latestFacts;
+    if (request.movedRemoteRefs.size > 0 && !request.refreshStructure && !request.refreshWorktree) {
+      if (facts?.isGit && target.latestGit?.isGit) {
+        try {
+          await this.refreshRefDerivedSnapshot(target, facts, request.movedRemoteRefs);
+          return this.combineSnapshot(target);
+        } catch (error) {
+          this.logger.debug(
+            { err: error, cwd: target.cwd, movedRemoteRefs: [...request.movedRemoteRefs] },
+            "Narrow remote ref refresh failed; using structural refresh",
+          );
+        }
+      }
+      facts = await this.refreshGitSnapshot(target, {
+        ...request,
+        refreshStructure: true,
+        refreshWorktree: true,
+      });
+      return this.combineSnapshot(target);
+    }
+    if (request.refreshStructure || !facts || !target.latestGit) {
+      facts = await this.refreshGitSnapshot(target, request);
+    } else if (request.refreshWorktree) {
+      await this.refreshWorktreeSnapshot(target, facts);
+    }
+    if (!facts) {
+      facts = await this.refreshGitSnapshot(target, request);
+    }
     if (request.includeForge) {
       await this.refreshForgeSnapshot(target, request, facts);
     }
@@ -1793,6 +2845,63 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const snapshot = this.combineSnapshot(target);
     target.latestSnapshotLoadedAtMs = this.deps.now().getTime();
     return snapshot;
+  }
+
+  private async refreshRefDerivedSnapshot(
+    target: WorkspaceGitTarget,
+    facts: Extract<CheckoutSnapshotFacts, { isGit: true }>,
+    movedRemoteRefs: ReadonlySet<string>,
+  ): Promise<void> {
+    const latestGit = target.latestGit;
+    if (!latestGit?.isGit) {
+      throw new Error("Remote ref refresh requires a warmed Git snapshot");
+    }
+    target.lastShellOutAtMs = this.deps.now().getTime();
+    const derived = await this.deps.getCheckoutRefDerivedState(
+      target.cwd,
+      facts,
+      { aheadBehind: latestGit.aheadBehind, diffStat: latestGit.diffStat },
+      movedRemoteRefs,
+      { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot, logger: this.logger, facts },
+    );
+    target.latestFacts = { ...facts, upstreamStatus: derived.upstreamStatus };
+    target.latestGit = {
+      ...latestGit,
+      aheadBehind: derived.aheadBehind,
+      diffStat: derived.diffStat,
+      upstreamRef: derived.upstreamStatus?.ref ?? null,
+      aheadOfOrigin: derived.upstreamStatus?.aheadBehind.ahead ?? null,
+      behindOfOrigin: derived.upstreamStatus?.aheadBehind.behind ?? null,
+    };
+    const loadedAtMs = this.deps.now().getTime();
+    target.latestGitLoadedAtMs = loadedAtMs;
+  }
+
+  private async refreshWorktreeSnapshot(
+    target: WorkspaceGitTarget,
+    facts: CheckoutSnapshotFacts,
+  ): Promise<void> {
+    const latestGit = target.latestGit;
+    if (!latestGit || !facts.isGit) {
+      return;
+    }
+
+    target.lastShellOutAtMs = this.deps.now().getTime();
+    const context: CheckoutContext = {
+      paseoHome: this.paseoHome,
+      worktreesRoot: this.worktreesRoot,
+      logger: this.logger,
+      facts,
+    };
+    const worktree = await this.deps.getCheckoutWorktreeState(target.cwd, context);
+    target.latestGit = {
+      ...latestGit,
+      isDirty: worktree.isDirty,
+      diffStat: worktree.diffStat,
+    };
+    const loadedAtMs = this.deps.now().getTime();
+    target.latestGitLoadedAtMs = loadedAtMs;
+    target.latestWorktreeRefreshAtMs = loadedAtMs;
   }
 
   private async refreshGitSnapshot(
@@ -1809,23 +2918,28 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
     };
-    const facts = await this.loadCheckoutFacts(target, {
-      ...baseContext,
-      allowRecent: !request.force,
-    });
+    const facts = await this.loadCheckoutFacts(target, baseContext);
     const context: CheckoutContext = { ...baseContext, facts };
     const checkoutStatus = await this.deps.getCheckoutStatus(cwd, context);
     if (!checkoutStatus.isGit) {
       target.latestGit = buildNotGitSnapshot(cwd).git;
-      target.latestGitLoadedAtMs = this.deps.now().getTime();
+      const loadedAtMs = this.deps.now().getTime();
+      target.latestGitLoadedAtMs = loadedAtMs;
+      target.latestStructuralRefreshAtMs = loadedAtMs;
+      target.latestWorktreeRefreshAtMs = loadedAtMs;
       target.latestForge = buildForgeUnavailableSnapshot();
       target.latestForgeLoadedAtMs = target.latestGitLoadedAtMs;
       return facts;
     }
 
-    const diffStat = await this.deps
-      .getCheckoutShortstat(cwd, context, { force: request.force })
-      .catch(() => null);
+    const refreshWorktree = request.refreshWorktree || target.latestGit === null;
+    const diffStat = refreshWorktree
+      ? await this.deps
+          .getCheckoutShortstat(cwd, context, {
+            force: request.force || target.latestGit !== null,
+          })
+          .catch(() => null)
+      : (target.latestGit?.diffStat ?? null);
 
     target.latestGit = {
       isGit: true,
@@ -1834,15 +2948,23 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       currentBranch: checkoutStatus.currentBranch,
       remoteUrl: checkoutStatus.remoteUrl,
       isPaseoOwnedWorktree: checkoutStatus.isPaseoOwnedWorktree,
-      isDirty: checkoutStatus.isDirty,
+      isDirty: refreshWorktree
+        ? checkoutStatus.isDirty
+        : (target.latestGit?.isDirty ?? checkoutStatus.isDirty),
       baseRef: checkoutStatus.baseRef,
       aheadBehind: checkoutStatus.aheadBehind,
+      upstreamRef: checkoutStatus.upstreamRef,
       aheadOfOrigin: checkoutStatus.aheadOfOrigin,
       behindOfOrigin: checkoutStatus.behindOfOrigin,
       hasRemote: checkoutStatus.hasRemote,
       diffStat,
     };
-    target.latestGitLoadedAtMs = this.deps.now().getTime();
+    const loadedAtMs = this.deps.now().getTime();
+    target.latestGitLoadedAtMs = loadedAtMs;
+    target.latestStructuralRefreshAtMs = loadedAtMs;
+    if (refreshWorktree) {
+      target.latestWorktreeRefreshAtMs = loadedAtMs;
+    }
 
     if (previousForgePrStatusPollKey !== this.getForgePrStatusPollKey(target)) {
       target.latestForge = buildForgeUnavailableSnapshot();
@@ -1984,8 +3106,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       "Running background git fetch",
     );
 
+    let result: WorkspaceGitFetchResult | null = null;
+    const eventsBeforeFetchSnapshot: parcelWatcher.Event[] = [];
     try {
-      await this.deps.runGitFetch(target.cwd);
+      result = await this.deps.runGitFetch(target.cwd, {
+        onRefSnapshot: (phase) => {
+          const events = target.bufferedFetchMetadataEvents.splice(0);
+          if (phase === "before") {
+            eventsBeforeFetchSnapshot.push(...events);
+          }
+        },
+      });
     } catch (error) {
       this.logger.warn(
         { err: error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
@@ -1993,21 +3124,74 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       );
     } finally {
       target.fetchInFlight = false;
-      await Promise.all(
-        Array.from(target.workspaceKeys, async (workspaceKey) => {
-          const workspaceTarget = this.workspaceTargets.get(workspaceKey);
-          if (!workspaceTarget) {
-            return;
-          }
-          await this.refreshWorkspaceTarget(workspaceTarget, {
-            force: false,
-            includeForge: false,
-            reason: "repo-fetch",
-            notify: true,
-          });
-        }),
+    }
+    this.flushFetchMetadataEvents(target, eventsBeforeFetchSnapshot);
+    if (!result || result.changes === null) {
+      target.recentFetchRemoteRefChanges.clear();
+      target.knownRemoteRefs = null;
+      this.flushBufferedFetchMetadataEvents(target);
+      if (result) {
+        this.logger.warn(
+          { err: result.error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
+          "Background git fetch ref classification failed; using structural refresh",
+        );
+      }
+      this.scheduleRepoMetadataRefresh(target, "repo-fetch-unclassified", false);
+      return;
+    }
+    if (result.error) {
+      this.logger.warn(
+        { err: result.error, repoGitRoot: target.repoGitRoot, cwd: target.cwd },
+        "Background git fetch completed with errors after changing refs",
       );
     }
+    const expiresAtMs = this.deps.now().getTime() + FETCH_METADATA_ECHO_TTL_MS;
+    const remoteRefShapeChanged =
+      target.knownRemoteRefs !== null &&
+      result.remoteRefs !== undefined &&
+      !setsEqual(target.knownRemoteRefs, result.remoteRefs);
+    if (result.remoteRefs) {
+      target.knownRemoteRefs = new Set(result.remoteRefs);
+    }
+    target.recentFetchRemoteRefChanges.clear();
+    for (const change of result.changes) {
+      target.recentFetchRemoteRefChanges.set(change.ref, { change, expiresAtMs });
+    }
+    this.flushBufferedFetchMetadataEvents(target);
+    if (
+      result.nonRemoteRefsChanged === true ||
+      remoteRefShapeChanged ||
+      result.changes.some((change) => change.kind !== "moved")
+    ) {
+      this.scheduleRepoMetadataRefresh(target, "repo-fetch-ref-shape", false);
+      return;
+    }
+    if (result.changes.length === 0) {
+      return;
+    }
+    const refreshes = new Map<string, RepoMetadataWorkspaceRefresh>();
+    for (const change of result.changes) {
+      this.routeRemoteBranchRef(target, change.ref, refreshes, { narrow: true });
+    }
+    this.scheduleRepoMetadataRefresh(target, "repo-fetch", false, refreshes);
+  }
+
+  private flushBufferedFetchMetadataEvents(target: RepoGitTarget): void {
+    this.flushFetchMetadataEvents(target, target.bufferedFetchMetadataEvents.splice(0));
+  }
+
+  private flushFetchMetadataEvents(target: RepoGitTarget, events: parcelWatcher.Event[]): void {
+    if (events.length === 0) {
+      return;
+    }
+    const routedRefreshes = this.routeRepoMetadataEvents(target, events);
+    this.scheduleRepoMetadataRefresh(
+      target,
+      "git-metadata-watch-after-fetch",
+      routedRefreshes === null ||
+        [...routedRefreshes.values()].some((refresh) => refresh.structural),
+      routedRefreshes,
+    );
   }
 
   private removeWorkspaceListener(cwd: string, listener: WorkspaceGitListener): void {
@@ -2031,6 +3215,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       if (repoTarget && repoTarget.workspaceKeys.size === 0) {
         this.closeRepoTarget(repoTarget);
         this.repoTargets.delete(target.repoGitRoot);
+      } else if (repoTarget?.cwd === target.cwd) {
+        repoTarget.cwd = repoTarget.workspaceKeys.values().next().value ?? repoTarget.cwd;
       }
     }
 
@@ -2045,7 +3231,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
 
     target.listeners.delete(listener);
-    if (target.listeners.size > 0) {
+    if (target.listeners.size > 0 || target.workspaceKeys.size > 0) {
       return;
     }
 
@@ -2053,46 +3239,104 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workingTreeWatchTargets.delete(cwd);
   }
 
+  private removeWorkspaceWorkingTreeLink(
+    target: WorkingTreeWatchTarget,
+    workspaceKey: string,
+  ): void {
+    target.workspaceKeys.delete(workspaceKey);
+    if (target.workspaceKeys.size > 0 || target.listeners.size > 0) {
+      return;
+    }
+    this.closeWorkingTreeWatchTarget(target);
+    if (this.workingTreeWatchTargets.get(target.cwd) === target) {
+      this.workingTreeWatchTargets.delete(target.cwd);
+    }
+  }
+
+  private closeWorkingTreeWatchTargetIfUnused(target: WorkingTreeWatchTarget): void {
+    if (
+      target.closed ||
+      target.workspaceKeys.size > 0 ||
+      target.listeners.size > 0 ||
+      this.workingTreeWatchTargets.get(target.cwd) !== target
+    ) {
+      return;
+    }
+    this.closeWorkingTreeWatchTarget(target);
+    this.workingTreeWatchTargets.delete(target.cwd);
+  }
+
   private closeWorkspaceTarget(target: WorkspaceGitTarget): void {
     target.closed = true;
+    if (target.workingTreeWatchTarget) {
+      this.removeWorkspaceWorkingTreeLink(target.workingTreeWatchTarget, target.cwd);
+      target.workingTreeWatchTarget = null;
+    }
     if (target.debounceTimer) {
       clearTimeout(target.debounceTimer);
       target.debounceTimer = null;
     }
     if (target.selfHealTimer) {
-      clearInterval(target.selfHealTimer);
+      clearTimeout(target.selfHealTimer);
       target.selfHealTimer = null;
     }
     this.stopForgePrStatusPollForTarget(target);
-
-    for (const watcher of target.watchers) {
-      watcher.close();
-    }
-    target.watchers = [];
     target.listeners.clear();
   }
 
   private closeWorkingTreeWatchTarget(target: WorkingTreeWatchTarget): void {
-    if (target.fallbackRefreshInterval) {
-      clearInterval(target.fallbackRefreshInterval);
-      target.fallbackRefreshInterval = null;
+    target.closed = true;
+    for (const alias of target.aliases) {
+      if (this.workingTreeWatchAliases.get(alias) === target.cwd) {
+        this.workingTreeWatchAliases.delete(alias);
+      }
+    }
+    target.aliases.clear();
+    if (target.fallbackPollTimer) {
+      clearTimeout(target.fallbackPollTimer);
+      target.fallbackPollTimer = null;
+    }
+    target.fallbackPolling = false;
+    if (target.recovery.timer) {
+      clearTimeout(target.recovery.timer);
+      target.recovery.timer = null;
     }
 
-    for (const watcher of target.watchers) {
-      watcher.close();
+    if (target.subscription) {
+      const subscription = target.subscription;
+      target.subscription = null;
+      void subscription.unsubscribe().catch((error) => {
+        this.logger.warn({ err: error, cwd: target.cwd }, "Failed to stop working tree watcher");
+      });
     }
-    target.watchers = [];
-    target.watchedPaths.clear();
+    target.workspaceKeys.clear();
     target.listeners.clear();
-    if (target.repoWatchPath) {
-      this.linuxIgnoredDirsCache.delete(target.repoWatchPath);
-    }
   }
 
   private closeRepoTarget(target: RepoGitTarget): void {
+    target.closed = true;
     if (target.intervalId) {
       clearInterval(target.intervalId);
       target.intervalId = null;
+    }
+    if (target.fallbackPollTimer) {
+      clearTimeout(target.fallbackPollTimer);
+      target.fallbackPollTimer = null;
+    }
+    target.fallbackPolling = false;
+    if (target.recovery.timer) {
+      clearTimeout(target.recovery.timer);
+      target.recovery.timer = null;
+    }
+    if (target.subscription) {
+      const subscription = target.subscription;
+      target.subscription = null;
+      void subscription.unsubscribe().catch((error) => {
+        this.logger.warn(
+          { err: error, repoGitRoot: target.repoGitRoot },
+          "Failed to stop repository metadata watcher",
+        );
+      });
     }
     target.workspaceKeys.clear();
   }
@@ -2206,6 +3450,7 @@ function buildNotGitSnapshot(cwd: string): WorkspaceGitRuntimeSnapshot {
       isDirty: null,
       baseRef: null,
       aheadBehind: null,
+      upstreamRef: null,
       aheadOfOrigin: null,
       behindOfOrigin: null,
       hasRemote: false,
@@ -2281,12 +3526,4 @@ function computeGenericForgeNextInterval(
     baseInterval * 2 ** (consecutiveErrors - 1),
     FORGE_PR_STATUS_POLL_ERROR_BACKOFF_CAP_MS,
   );
-}
-
-async function runGitFetch(cwd: string): Promise<void> {
-  await runGitCommand(["fetch", "origin", "--prune"], {
-    cwd,
-    envOverlay: { GIT_TERMINAL_PROMPT: "0" },
-    timeout: 120_000,
-  });
 }
