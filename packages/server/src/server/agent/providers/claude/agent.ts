@@ -795,6 +795,10 @@ export function sliceHistoryToRecentTurns<T extends { item: AgentTimelineItem }>
   return entries;
 }
 
+/** How long after an external idle report tailed lines are treated as that
+ * turn's trailing flush rather than a new turn. */
+const EXTERNAL_IDLE_SETTLE_MS = 15_000;
+
 const HOOK_BLOCK_PREFIX = "UserPromptSubmit operation blocked by hook:\n";
 
 /**
@@ -2124,6 +2128,10 @@ class ClaudeAgentSession implements AgentSession {
    * so its process reports real turn boundaries and tail activity must not be
    * used to infer them. See noteExternalTurn. */
   private externalTurnReportsSeen = false;
+  /** When the external process last reported its turn finished. Tail activity
+   * inside EXTERNAL_IDLE_SETTLE_MS of it is that turn's trailing flush, not a
+   * new turn. */
+  private lastExternalIdleAt = 0;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly timelineAssembler = new TimelineAssembler();
   private readonly taskProtocolSource = new ClaudeTaskProtocolSource({
@@ -2456,10 +2464,15 @@ class ClaudeAgentSession implements AgentSession {
    */
   noteExternalTurn(state: ExternalTurnState): void {
     if (state === "running" || state === "activity") {
-      // Once the external process reports its own turn boundaries, those own
-      // the turn: tailed lines keep arriving for seconds after its idle report
-      // and reopening the turn on them would leave the agent running forever.
-      if (state === "activity" && this.externalTurnReportsSeen) {
+      // Tailed lines keep arriving for seconds after an idle report, and
+      // reopening the turn on those would leave the agent running forever —
+      // so activity is ignored for a short window after an idle report. It is
+      // NOT ignored indefinitely: latching that suppression on the first
+      // report ever seen meant a single missed `running` (the hook throttles
+      // to one a minute, and a daemon restart or a forced idle can swallow
+      // one) left the agent reading idle while the pane visibly worked, with
+      // nothing able to correct it (measured 2026-08-13).
+      if (state === "activity" && Date.now() - this.lastExternalIdleAt < EXTERNAL_IDLE_SETTLE_MS) {
         return;
       }
       this.externalTurnReportsSeen ||= state === "running";
@@ -2478,6 +2491,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     this.deferredExternalTurn = false;
+    this.lastExternalIdleAt = Date.now();
     if (!this.autonomousTurn?.external) {
       return;
     }

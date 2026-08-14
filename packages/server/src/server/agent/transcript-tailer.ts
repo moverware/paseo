@@ -3,6 +3,18 @@ import type { Logger } from "pino";
 import type { AgentSession } from "./agent-sdk-types.js";
 
 export const TRANSCRIPT_TAILER_DEFAULT_POLL_MS = 1000;
+/**
+ * An external turn ends on its process's own idle report. When that report
+ * never arrives — the pane was killed mid-turn, its hooks are not wired, the
+ * daemon restarted across the turn — nothing else closes the turn and the
+ * agent reads `running` forever (measured 2026-08-13: four agents stuck,
+ * one for 9h). The transcript is the evidence: the external process appends
+ * to it continuously while it works, so a transcript that has not grown in
+ * this long means the turn is over. Generous, because a single long tool
+ * call writes nothing while it runs.
+ */
+export const TRANSCRIPT_IDLE_AFTER_MS = 5 * 60_000;
+const TRANSCRIPT_IDLE_SWEEP_MS = 30_000;
 
 export interface TranscriptTailerOptions {
   logger: Logger;
@@ -12,6 +24,11 @@ export interface TranscriptTailerOptions {
    * too, and must NOT count here — those lines exist only in the transcript. */
   hasDaemonRun: (agentId: string) => boolean;
   pollIntervalMs?: number;
+  /** How long a transcript may sit unchanged before an open external turn is
+   * treated as finished. Defaults to TRANSCRIPT_IDLE_AFTER_MS. */
+  idleAfterMs?: number;
+  /** How often to check for quiescent transcripts. */
+  idleSweepIntervalMs?: number;
 }
 
 interface TailedTranscript {
@@ -43,11 +60,54 @@ export class TranscriptTailer {
   private readonly logger: Logger;
   private readonly options: TranscriptTailerOptions;
   private readonly pollIntervalMs: number;
+  private readonly idleAfterMs: number;
+  private readonly idleSweep: ReturnType<typeof setInterval>;
 
   constructor(options: TranscriptTailerOptions) {
     this.options = options;
     this.logger = options.logger.child({ component: "transcript-tailer" });
     this.pollIntervalMs = options.pollIntervalMs ?? TRANSCRIPT_TAILER_DEFAULT_POLL_MS;
+    this.idleAfterMs = options.idleAfterMs ?? TRANSCRIPT_IDLE_AFTER_MS;
+    this.idleSweep = setInterval(
+      () => this.closeQuiescentTurns(),
+      options.idleSweepIntervalMs ?? TRANSCRIPT_IDLE_SWEEP_MS,
+    );
+    this.idleSweep.unref?.();
+  }
+
+  /**
+   * Close external turns whose transcript has gone quiet. See
+   * TRANSCRIPT_IDLE_AFTER_MS — this is the backstop for an idle report that
+   * never arrives, and it never fires while the daemon runs the turn itself.
+   */
+  closeQuiescentTurns(now: number = Date.now()): void {
+    for (const [agentId, state] of this.tailed) {
+      if (state.session.isExternalTurnActive?.() !== true) {
+        continue;
+      }
+      if (this.options.hasDaemonRun(agentId)) {
+        continue;
+      }
+      let mtimeMs: number;
+      try {
+        mtimeMs = fs.statSync(state.path).mtimeMs;
+      } catch {
+        // The transcript is gone; nothing can finish this turn but us.
+        mtimeMs = 0;
+      }
+      if (now - mtimeMs < this.idleAfterMs) {
+        continue;
+      }
+      this.logger.info(
+        { agentId, quietForMs: now - mtimeMs },
+        "closing external turn — transcript quiescent",
+      );
+      try {
+        state.session.noteExternalTurn?.("idle");
+      } catch (error) {
+        this.logger.warn({ err: error, agentId }, "failed to close quiescent external turn");
+      }
+    }
   }
 
   /** Start (or refresh) tailing an agent's transcript. Skips content already
@@ -78,6 +138,12 @@ export class TranscriptTailer {
     fs.watchFile(path, { interval: this.pollIntervalMs }, () => {
       this.consume(agentId);
     });
+  }
+
+  /** Bytes of the transcript this tailer has already consumed. Tests wait on
+   * this instead of a wall-clock guess about when the file poll fired. */
+  observedOffset(agentId: string): number | null {
+    return this.tailed.get(agentId)?.offset ?? null;
   }
 
   disarm(agentId: string): void {
@@ -124,6 +190,7 @@ export class TranscriptTailer {
   }
 
   dispose(): void {
+    clearInterval(this.idleSweep);
     // Deleting during Map iteration is safe per the iteration protocol.
     for (const agentId of this.tailed.keys()) {
       this.disarm(agentId);

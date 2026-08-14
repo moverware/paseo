@@ -82,7 +82,11 @@ describe("TranscriptTailer", () => {
 
     inFlight = true;
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "daemon-run" })}\n`);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
+    // Wait for the poll to actually observe the write and skip it, rather than
+    // guessing at a wall-clock interval that a loaded machine can miss.
+    await vi.waitFor(() => {
+      expect(tailer.observedOffset("agent-1")).toBe(fs.statSync(transcriptPath).size);
+    });
 
     inFlight = false;
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "external" })}\n`);
@@ -99,7 +103,9 @@ describe("TranscriptTailer", () => {
     });
 
     fs.writeFileSync(transcriptPath, "");
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
+    await vi.waitFor(() => {
+      expect(tailer.observedOffset("agent-1")).toBe(0);
+    });
 
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "after-truncate" })}\n`);
     await vi.waitFor(() => {
@@ -114,5 +120,99 @@ describe("TranscriptTailer", () => {
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "ignored" })}\n`);
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
     expect(ingestedTexts()).toEqual([]);
+  });
+});
+
+describe("TranscriptTailer quiescence backstop", () => {
+  let dir: string;
+  let transcriptPath: string;
+  let tailer: TranscriptTailer;
+
+  function buildExternalSession(
+    path_: string,
+    state: { active: boolean; notes: string[] },
+  ): AgentSession {
+    const session: Partial<AgentSession> = {
+      provider: "claude",
+      externalTranscriptPath: () => path_,
+      ingestExternalTranscriptLines: () => {},
+      isExternalTurnActive: () => state.active,
+      noteExternalTurn: (next: string) => {
+        state.notes.push(next);
+        if (next === "idle") {
+          state.active = false;
+        }
+      },
+    };
+    return session as AgentSession;
+  }
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "transcript-idle-"));
+    transcriptPath = path.join(dir, "session.jsonl");
+    fs.writeFileSync(transcriptPath, "");
+  });
+
+  afterEach(() => {
+    tailer?.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("closes an external turn whose transcript has gone quiet", () => {
+    const state = { active: true, notes: [] as string[] };
+    tailer = new TranscriptTailer({
+      logger: pino({ enabled: false }),
+      hasDaemonRun: () => false,
+      idleAfterMs: 60_000,
+    });
+    tailer.arm("agent-1", buildExternalSession(transcriptPath, state));
+
+    // Transcript written now: not yet quiet.
+    tailer.closeQuiescentTurns(Date.now());
+    expect(state.notes).toEqual([]);
+
+    // Same file, judged from far enough in the future.
+    tailer.closeQuiescentTurns(Date.now() + 120_000);
+    expect(state.notes).toEqual(["idle"]);
+  });
+
+  test("leaves a turn open while the daemon is running it", () => {
+    const state = { active: true, notes: [] as string[] };
+    tailer = new TranscriptTailer({
+      logger: pino({ enabled: false }),
+      hasDaemonRun: () => true,
+      idleAfterMs: 60_000,
+    });
+    tailer.arm("agent-1", buildExternalSession(transcriptPath, state));
+
+    tailer.closeQuiescentTurns(Date.now() + 120_000);
+    expect(state.notes).toEqual([]);
+  });
+
+  test("ignores agents with no external turn open", () => {
+    const state = { active: false, notes: [] as string[] };
+    tailer = new TranscriptTailer({
+      logger: pino({ enabled: false }),
+      hasDaemonRun: () => false,
+      idleAfterMs: 60_000,
+    });
+    tailer.arm("agent-1", buildExternalSession(transcriptPath, state));
+
+    tailer.closeQuiescentTurns(Date.now() + 120_000);
+    expect(state.notes).toEqual([]);
+  });
+
+  test("closes the turn when the transcript has disappeared", () => {
+    const state = { active: true, notes: [] as string[] };
+    tailer = new TranscriptTailer({
+      logger: pino({ enabled: false }),
+      hasDaemonRun: () => false,
+      idleAfterMs: 60_000,
+    });
+    tailer.arm("agent-1", buildExternalSession(transcriptPath, state));
+    fs.rmSync(transcriptPath);
+
+    tailer.closeQuiescentTurns(Date.now());
+    expect(state.notes).toEqual(["idle"]);
   });
 });

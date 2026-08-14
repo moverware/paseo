@@ -508,3 +508,33 @@ describe("out-of-band slash commands for an externally-driven agent", () => {
     }
   });
 });
+
+describe("external turn recovery after a missed report", () => {
+  test("tail activity reopens a turn once the idle settle window has passed", async () => {
+    const { session, events, close } = await createSession();
+    try {
+      session.noteExternalTurn?.("running");
+      session.noteExternalTurn?.("idle");
+      expect(turnEvents(events)).toEqual(["turn_started", "turn_completed"]);
+
+      // Trailing flush: lines arriving right after idle must not reopen it.
+      session.noteExternalTurn?.("activity");
+      expect(session.isExternalTurnActive?.()).toBe(false);
+
+      // A later turn whose `running` report was missed — the hook throttles to
+      // one a minute, and a restart or a forced idle can swallow one — must
+      // still be recoverable from transcript activity alone.
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date(Date.now() + 60_000));
+        session.noteExternalTurn?.("activity");
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(session.isExternalTurnActive?.()).toBe(true);
+      expect(turnEvents(events)).toEqual(["turn_started", "turn_completed", "turn_started"]);
+    } finally {
+      await close();
+    }
+  });
+});
