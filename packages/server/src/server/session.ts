@@ -3533,6 +3533,8 @@ export class Session {
       let snapshot: ManagedAgent;
       const existing = this.agentManager.getAgent(agentId);
       if (existing) {
+        // FORK: a refresh must not stop a turn running in an external process.
+        this.agentManager.releaseExternalTurn(agentId);
         await this.interruptAgentIfRunning(agentId);
         snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
           rehydrateFromDisk: true,

@@ -260,6 +260,27 @@ describe("external turns in the agent manager", () => {
     expect(fixture.session.isExternalTurnActive()).toBe(false);
   });
 
+  test("releasing an external turn frees the run slot without interrupting the pane", async () => {
+    // The refresh path: the app blindly interrupts any running turn before
+    // rehydrating an agent. For an external turn the session releases it
+    // first, so the interrupt gate (hasInFlightRun) finds nothing to cancel
+    // and no Esc reaches the pane.
+    fixture = await createFixture();
+    fixture.manager.reportExternalTurn(fixture.agentId, "running");
+    await settle();
+    expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(true);
+
+    expect(fixture.manager.releaseExternalTurn(fixture.agentId)).toBe(true);
+    expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
+    expect(fixture.session.interruptCount).toBe(0);
+    expect(fixture.session.isExternalTurnActive()).toBe(false);
+    expect(fixture.status()).toBe("idle");
+
+    // With no external turn open the release is a no-op, and a genuine stop
+    // still reaches the session.
+    expect(fixture.manager.releaseExternalTurn(fixture.agentId)).toBe(false);
+  });
+
   test("a prompt sent while no external turn runs still starts a daemon turn", async () => {
     fixture = await createFixture();
 

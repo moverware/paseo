@@ -847,13 +847,18 @@ export class AgentManager {
   }
 
   /**
-   * Give up the tracked external turn without interrupting it, because the
-   * daemon is about to run a turn on this session itself. The external
+   * Give up the tracked external turn without interrupting it. Used where the
+   * daemon needs the run slot back but the turn itself should keep going in
+   * the external process: replacing the run with a daemon turn (the external
    * process's own prompt hook interrupts the pane as part of delivering that
    * prompt; a daemon-side interrupt on top of it races the same keystrokes and
-   * merges the two prompts in the pane's composer.
+   * merges the two prompts in the pane's composer), and a client-initiated
+   * refresh (which interrupts any running turn before rehydrating — sent
+   * blind by the app on reconnect, so for an external turn that Esc lands in
+   * a pane doing real work; it killed four in-flight background agents,
+   * 2026-08-14). The tail or the next heartbeat re-marks the turn running.
    */
-  private releaseExternalTurn(agentId: string): boolean {
+  releaseExternalTurn(agentId: string): boolean {
     const agent = this.agents.get(agentId);
     if (!agent || agent.session.isExternalTurnActive?.() !== true) {
       return false;
