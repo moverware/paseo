@@ -2374,8 +2374,10 @@ class ClaudeAgentSession implements AgentSession {
 
     if (this.autonomousTurn) {
       // FORK: a turn running in an external process is stopped where it runs.
-      // Reached from upstream's cancelAgentRun with no manager patch, so the
-      // phone's stop button, a replaced run and a reload all route here.
+      // Reached from upstream's cancelAgentRun with no manager patch. Only
+      // deliberate stops should land here — the phone's stop button, archiving
+      // the agent. Incidental cancels (a replaced run, a client refresh)
+      // release the external turn first and never reach this.
       if (this.autonomousTurn.external) {
         spawnExternalTurnCommand({
           kind: "interrupt",
