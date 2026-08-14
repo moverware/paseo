@@ -2632,6 +2632,21 @@ export class Session {
       // own boundaries here. Handled before updateAgentCommand so a report
       // that carries no name or labels is still a complete request.
       if (externalTurn) {
+        // Load first: reports are a no-op for an agent the daemon has not
+        // loaded, which is every agent after a restart — the pane would work
+        // visibly while the client read idle, and the transcript tailer would
+        // not be armed to stream it either (measured 2026-08-13). Loading is
+        // idempotent and shares the loader's per-agent in-flight operation.
+        await ensureAgentLoaded(agentId, {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        }).catch((error) => {
+          this.sessionLogger.warn(
+            { err: error, agentId },
+            "external turn report could not load its agent",
+          );
+        });
         this.agentManager.reportExternalTurn(agentId, externalTurn);
         if (!name?.trim() && !(labels && Object.keys(labels).length > 0)) {
           this.emit({
