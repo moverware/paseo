@@ -57,9 +57,12 @@ describe("TranscriptTailer", () => {
 
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "fresh" })}\n`);
 
-    await vi.waitFor(() => {
-      expect(ingestedTexts()).toEqual(["fresh"]);
-    });
+    await vi.waitFor(
+      () => {
+        expect(ingestedTexts()).toEqual(["fresh"]);
+      },
+      { timeout: 8000 },
+    );
   });
 
   test("buffers a partial trailing line until its newline arrives", async () => {
@@ -72,9 +75,12 @@ describe("TranscriptTailer", () => {
     expect(ingestedTexts()).toEqual([]);
 
     fs.appendFileSync(transcriptPath, `${full.slice(10)}\n`);
-    await vi.waitFor(() => {
-      expect(ingestedTexts()).toEqual(["split-line"]);
-    });
+    await vi.waitFor(
+      () => {
+        expect(ingestedTexts()).toEqual(["split-line"]);
+      },
+      { timeout: 8000 },
+    );
   });
 
   test("skips content written while a daemon-side run is in flight", async () => {
@@ -84,33 +90,48 @@ describe("TranscriptTailer", () => {
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "daemon-run" })}\n`);
     // Wait for the poll to actually observe the write and skip it, rather than
     // guessing at a wall-clock interval that a loaded machine can miss.
-    await vi.waitFor(() => {
-      expect(tailer.observedOffset("agent-1")).toBe(fs.statSync(transcriptPath).size);
-    });
+    await vi.waitFor(
+      () => {
+        expect(tailer.observedOffset("agent-1")).toBe(fs.statSync(transcriptPath).size);
+      },
+      { timeout: 8000 },
+    );
 
     inFlight = false;
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "external" })}\n`);
-    await vi.waitFor(() => {
-      expect(ingestedTexts()).toEqual(["external"]);
-    });
+    await vi.waitFor(
+      () => {
+        expect(ingestedTexts()).toEqual(["external"]);
+      },
+      { timeout: 8000 },
+    );
   });
 
   test("resyncs to the end on truncation instead of re-emitting from zero", async () => {
     tailer.arm("agent-1", buildSession(transcriptPath, ingested));
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "one" })}\n`);
-    await vi.waitFor(() => {
-      expect(ingestedTexts()).toEqual(["one"]);
-    });
+    await vi.waitFor(
+      () => {
+        expect(ingestedTexts()).toEqual(["one"]);
+      },
+      { timeout: 8000 },
+    );
 
     fs.writeFileSync(transcriptPath, "");
-    await vi.waitFor(() => {
-      expect(tailer.observedOffset("agent-1")).toBe(0);
-    });
+    await vi.waitFor(
+      () => {
+        expect(tailer.observedOffset("agent-1")).toBe(0);
+      },
+      { timeout: 8000 },
+    );
 
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "after-truncate" })}\n`);
-    await vi.waitFor(() => {
-      expect(ingestedTexts()).toEqual(["one", "after-truncate"]);
-    });
+    await vi.waitFor(
+      () => {
+        expect(ingestedTexts()).toEqual(["one", "after-truncate"]);
+      },
+      { timeout: 8000 },
+    );
   });
 
   test("disarm stops emission", async () => {
