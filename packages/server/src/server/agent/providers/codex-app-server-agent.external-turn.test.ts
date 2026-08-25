@@ -222,6 +222,36 @@ describe("codex external turns", () => {
   });
 });
 
+describe("codex out-of-band prompt delegation", () => {
+  test("every prompt on an externally-driven agent goes out-of-band, none otherwise", () => {
+    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({ daemon: { externalPromptCommand: ["/usr/bin/true"] } }),
+    );
+    const originalHome = process.env.PASEO_HOME;
+    process.env.PASEO_HOME = home;
+    try {
+      const driven = createSession();
+      driven.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
+      // Unlike Claude's slash-only routing, plain prompts delegate too —
+      // Codex's writer lock makes a daemon turn on a pane session impossible.
+      expect(driven.tryHandleOutOfBand?.("plain prompt")).not.toBeNull();
+      expect(driven.tryHandleOutOfBand?.("/compact")).not.toBeNull();
+
+      const daemonOwned = createSession();
+      expect(daemonOwned.tryHandleOutOfBand?.("plain prompt")).toBeNull();
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.PASEO_HOME;
+      } else {
+        process.env.PASEO_HOME = originalHome;
+      }
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("codex external turn interplay with the manager seams", () => {
   afterEach(() => {
     // noop — sessions here never spawn processes.

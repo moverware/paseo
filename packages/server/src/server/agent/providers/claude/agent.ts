@@ -2602,6 +2602,7 @@ class ClaudeAgentSession implements AgentSession {
       sessionId: this.claudeSessionId,
       cwd: this.config.cwd,
       labels: this.externalLabels,
+      provider: "claude",
     };
   }
 

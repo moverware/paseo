@@ -39,6 +39,7 @@ import { importSessionFromPersistence } from "../provider-session-import.js";
 // FORK: external-turn support for Codex TUI panes (see the fork notes in CLAUDE.md).
 import {
   EXTERNAL_ORIGIN_LABEL,
+  readExternalTurnCommand,
   spawnExternalTurnCommand,
   type ExternalAgentIdentity,
 } from "../external-turn-command.js";
@@ -131,6 +132,16 @@ function isArchivedCodexThreadResumeError(error: unknown, threadId: string): boo
     `session ${threadId} is archived. ` +
     `Run \`codex unarchive ${threadId}\` to unarchive it first.`;
   return error.message === expectedMessage;
+}
+
+// FORK: Codex enforces one writer per thread. A thread whose turns run in an
+// external process (a TUI pane) holds that writer, so a history-purpose
+// resume must tolerate the refusal — thread/read and the transcript tail
+// cover everything a mirror needs, and a real daemon turn still demands the
+// writer through its own ensureThreadLoaded call.
+function isActiveWriterCodexThreadResumeError(error: unknown, threadId: string): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.message.includes(`thread ${threadId} already has an active writer`);
 }
 
 function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolean {
@@ -3759,6 +3770,17 @@ export class CodexAppServerAgentSession implements AgentSession {
         );
         return;
       }
+      // FORK: see isActiveWriterCodexThreadResumeError.
+      if (
+        options.allowArchivedHistory === true &&
+        isActiveWriterCodexThreadResumeError(error, threadId)
+      ) {
+        this.logger.info(
+          { threadId },
+          "Loading Codex thread history without the writer — an external process holds it",
+        );
+        return;
+      }
       this.logger.warn({ error, threadId }, "Failed to resume persisted Codex thread");
       throw new Error(`Failed to resume Codex thread ${threadId}: ${message}`, { cause: error });
     }
@@ -4532,6 +4554,49 @@ export class CodexAppServerAgentSession implements AgentSession {
       sessionId: this.currentThreadId ?? this.resumeHandle?.sessionId ?? null,
       cwd: this.config.cwd,
       labels: this.externalLabels,
+      provider: CODEX_PROVIDER,
+    };
+  }
+
+  /**
+   * Prompts for an externally-driven Codex agent are delivered to the pane —
+   * ALL of them, not just slash commands as with Claude: Codex enforces one
+   * writer per thread, so the daemon cannot run a turn on a pane-held session
+   * at all. Out-of-band so delivery neither allocates nor cancels a turn;
+   * external-prompt waits for the pane's composer to go idle before typing,
+   * and the pane's own hooks then report the turn it accepts.
+   */
+  private tryHandleExternalOutOfBand(
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+    if (!this.isExternallyDriven() || readExternalTurnCommand("prompt") === null) {
+      return null;
+    }
+    const text = promptEchoText(prompt).trim();
+    if (!text) {
+      return null;
+    }
+    // With a clientMessageId the manager commits the user's row itself;
+    // without one (CLI, MCP, schedules) nothing has recorded the message yet.
+    const shouldEmitUserMessage = !options?.clientMessageId;
+    return {
+      run: async ({ emit }) => {
+        if (shouldEmitUserMessage) {
+          emit({
+            type: "timeline",
+            provider: CODEX_PROVIDER,
+            item: { type: "user_message", text },
+          });
+        }
+        this.externalEchoes.record(text);
+        spawnExternalTurnCommand({
+          kind: "prompt",
+          identity: this.externalIdentity(),
+          prompt: text,
+          logger: this.logger,
+        });
+      },
     };
   }
 
@@ -4727,7 +4792,15 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   tryHandleOutOfBand(
     prompt: AgentPromptInput,
+    options?: AgentRunOptions,
   ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+    // FORK: an externally-driven agent's prompts — /compact and /goal
+    // included — are delivered to the pane; the daemon-side implementations
+    // below all need the thread's writer, which the pane holds.
+    const external = this.tryHandleExternalOutOfBand(prompt, options);
+    if (external) {
+      return external;
+    }
     if (typeof prompt !== "string") return null;
     const parsed = this.parseSlashCommandInput(prompt);
     if (!parsed) return null;
@@ -6847,7 +6920,10 @@ export class CodexAppServerAgentClient implements AgentClient {
       provider: CODEX_PROVIDER,
       request: input,
       context,
-      resumeSession: this.resumeSession.bind(this),
+      // FORK: an import mirrors a session that lives elsewhere. Resume it for
+      // history so a TUI pane holding the thread's writer doesn't refuse it.
+      resumeSession: (handle, overrides, launchContext) =>
+        this.resumeSession(handle, overrides, launchContext, { purpose: "history" }),
     });
   }
 

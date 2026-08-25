@@ -110,7 +110,9 @@ export async function ensureAgentLoaded(
         buildConfigOverrides(record),
         agentId,
         extractTimestamps(record),
-        record.archivedAt ? { purpose: "history" } : undefined,
+        // FORK: an externally-driven mirror (origin=herdr) loads for history
+        // too — the pane holds the provider's writer (Codex enforces this).
+        record.archivedAt || record.labels?.origin === "herdr" ? { purpose: "history" } : undefined,
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
     } else {

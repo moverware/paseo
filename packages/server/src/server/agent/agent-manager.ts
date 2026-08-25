@@ -1371,7 +1371,15 @@ export class AgentManager {
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
 
     const session = handle
-      ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
+      ? await client.resumeSession(
+          handle,
+          providerLaunchConfig,
+          launchContext,
+          // FORK: reloading a mirror of an externally-driven session must not
+          // demand the provider's writer — the external process holds it
+          // (Codex refuses a second interactive resume outright).
+          existing.labels?.origin === "herdr" ? { purpose: "history" } : undefined,
+        )
       : await client.createSession(providerLaunchConfig, launchContext);
     await this.requireExternalMcpSupport(session, storedConfig);
 

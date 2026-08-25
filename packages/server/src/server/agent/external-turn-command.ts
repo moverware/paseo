@@ -44,6 +44,10 @@ export interface ExternalAgentIdentity {
   sessionId: string | null;
   cwd: string;
   labels: Record<string, string>;
+  /** Which provider CLI runs the pane — the command scripts fall back to
+   * matching panes by kind when the session id can't be matched (herdr does
+   * not surface codex session ids). */
+  provider?: string;
 }
 
 /** Argv for one of the external commands, or null when it is not configured. */
@@ -96,6 +100,7 @@ export function spawnExternalTurnCommand(params: {
         PASEO_AGENT_SESSION_ID: identity.sessionId ?? "",
         PASEO_AGENT_CWD: identity.cwd,
         PASEO_AGENT_LABELS: JSON.stringify(identity.labels),
+        PASEO_AGENT_PROVIDER: identity.provider ?? "claude",
         ...(prompt === undefined ? {} : { PASEO_PROMPT: prompt }),
       },
       stdio: "ignore",
