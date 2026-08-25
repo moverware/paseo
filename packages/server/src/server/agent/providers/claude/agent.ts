@@ -124,6 +124,7 @@ import {
   type ProviderCatalog,
   type ResolveAgentDefaultModeInput,
 } from "../../agent-sdk-types.js";
+import { extractBlockedPromptNote } from "./blocked-prompt-note.js";
 import { ExternalEchoLedger, promptEchoText } from "../../external-echo-ledger.js";
 import {
   EXTERNAL_ORIGIN_LABEL,
@@ -2428,18 +2429,40 @@ class ClaudeAgentSession implements AgentSession {
     // by the ingest itself, and the subagents track is rebuilt on replay.
     const restoredProviderSubagentIds: ReadonlySet<string> = new Set();
     const modelBefore = this.lastOptionsModel;
+    const blockedNotes: string[] = [];
     for (const line of content.split(/\r?\n/)) {
       this.ingestPersistedHistoryLine(line, timeline, restoredProviderSubagentIds);
       this.captureExternalRuntimeModel(line);
+      const blocked = extractBlockedPromptNote(line);
+      if (blocked) {
+        blockedNotes.push(blocked);
+      }
     }
     // Lines arriving for a turn nobody reported means work is happening in the
     // pane; open the turn before the rows go out so they carry its id.
     this.noteExternalTurn("activity");
+    let emitted = 0;
     for (const entry of timeline) {
       if (entry.item.type === "user_message" && this.externalEchoes.consume(entry.item.text)) {
         continue;
       }
+      emitted += 1;
       this.notifySubscribers({ type: "timeline", provider: "claude", item: entry.item });
+    }
+    for (const note of blockedNotes) {
+      this.notifySubscribers({
+        type: "timeline",
+        provider: "claude",
+        item: { type: "assistant_message", text: note },
+      });
+    }
+    if (blockedNotes.length > 0 && emitted === 0) {
+      // A blocked submission is a finished non-turn: nothing will ever report
+      // idle for it, so close the activity-opened turn now instead of leaving
+      // the agent reading running until the quiescence sweep. When real turn
+      // lines share the batch (a delivery retry that ran), the turn stays
+      // open and completes on its own report.
+      this.noteExternalTurn("idle");
     }
     if (this.lastOptionsModel !== modelBefore) {
       // The pane switched models. Emitted rather than left for a runtime-info
