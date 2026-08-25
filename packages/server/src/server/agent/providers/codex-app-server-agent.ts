@@ -25,6 +25,7 @@ import {
   type AgentSlashCommand,
   type AgentStreamEvent,
   type AgentTimelineItem,
+  type ExternalTurnState,
   type ToolCallTimelineItem,
   type AgentUsage,
   type FetchCatalogOptions,
@@ -35,6 +36,14 @@ import {
   type ProviderCatalog,
 } from "../agent-sdk-types.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
+// FORK: external-turn support for Codex TUI panes (see the fork notes in CLAUDE.md).
+import {
+  EXTERNAL_ORIGIN_LABEL,
+  spawnExternalTurnCommand,
+  type ExternalAgentIdentity,
+} from "../external-turn-command.js";
+import { ExternalEchoLedger, promptEchoText } from "../external-echo-ledger.js";
+import { parseCodexRolloutLine, resolveCodexRolloutPath } from "./codex/external-rollout.js";
 import type { Logger } from "pino";
 
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
@@ -132,6 +141,8 @@ function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolea
 const TURN_START_TIMEOUT_MS = 90 * 1000;
 const INTERRUPT_TIMEOUT_MS = 2_000;
 const CODEX_PROVIDER = "codex" as const;
+// FORK: see the external-turn members on CodexAppServerAgentSession.
+const CODEX_EXTERNAL_IDLE_SETTLE_MS = 15_000;
 // Codex treats most app-server client names as the model-request originator.
 // This reserved Codex name is non-originating, so requests keep Codex's default
 // CLI identity instead of showing up as Paseo in provider usage logs.
@@ -4006,6 +4017,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       throw new Error("A foreground turn is already active");
     }
 
+    // FORK: a daemon turn takes over from any open external turn, and a
+    // prompt on an externally-driven agent will echo back through the tail.
+    this.beginForegroundOverExternalTurn(prompt);
+
     this.dismissPendingPlanApprovals("Dismissed by a new prompt");
 
     try {
@@ -4444,6 +4459,18 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async interrupt(): Promise<void> {
+    // FORK: a turn running in an external process is stopped where it runs.
+    // Only deliberate stops land here — incidental cancels (a replaced run, a
+    // client refresh) release the external turn first and never reach this.
+    if (this.externalTurnOpen) {
+      spawnExternalTurnCommand({
+        kind: "interrupt",
+        identity: this.externalIdentity(),
+        logger: this.logger,
+      });
+      this.noteExternalTurn("idle");
+      return;
+    }
     if (!this.client || !this.currentThreadId) {
       throw new Error("Cannot interrupt Codex before the active thread is initialized");
     }
@@ -4472,8 +4499,160 @@ export class CodexAppServerAgentSession implements AgentSession {
     );
   }
 
+  // FORK: external-turn support — a turn executing in a Codex TUI pane the
+  // daemon doesn't own. Mirrors the Claude session (providers/claude/agent.ts):
+  // hook reports and tail activity open the turn, the Stop report (or the
+  // rollout's explicit task_complete) closes it, and the transcript tailer
+  // streams the pane's rollout lines through the ordinary event path.
+
+  private externalTurnOpen = false;
+  private deferredExternalTurn = false;
+  private externalTurnReportsSeen = false;
+  /** Lines tailing in shortly after an idle report are that turn's trailing
+   * flush, not a new turn; activity is ignored for this window after idle. */
+  private lastExternalIdleAt = 0;
+  private externalAgentId: string | null = null;
+  private externalLabels: Record<string, string> = {};
+  private readonly externalEchoes = new ExternalEchoLedger();
+  private cachedExternalTranscriptPath: string | null = null;
+
+  noteExternalIdentity(identity: { agentId: string; labels: Record<string, string> }): void {
+    this.externalAgentId = identity.agentId;
+    this.externalLabels = identity.labels;
+  }
+
+  private isExternallyDriven(): boolean {
+    return this.externalTurnReportsSeen || this.externalLabels.origin === EXTERNAL_ORIGIN_LABEL;
+  }
+
+  /** Everything the configured external commands need to find the pane. */
+  private externalIdentity(): ExternalAgentIdentity {
+    return {
+      agentId: this.externalAgentId ?? this.agentId ?? null,
+      sessionId: this.currentThreadId ?? this.resumeHandle?.sessionId ?? null,
+      cwd: this.config.cwd,
+      labels: this.externalLabels,
+    };
+  }
+
+  noteExternalTurn(state: ExternalTurnState): void {
+    if (state === "running" || state === "activity") {
+      if (
+        state === "activity" &&
+        Date.now() - this.lastExternalIdleAt < CODEX_EXTERNAL_IDLE_SETTLE_MS
+      ) {
+        return;
+      }
+      this.externalTurnReportsSeen ||= state === "running";
+      if (this.closed) {
+        return;
+      }
+      // A daemon-side foreground turn owns the lifecycle while it runs. Hold
+      // the report until it settles rather than dropping it.
+      if (this.activeForegroundTurnId) {
+        this.deferredExternalTurn ||= state === "running";
+        return;
+      }
+      if (this.externalTurnOpen) {
+        return;
+      }
+      this.externalTurnOpen = true;
+      this.notifySubscribers({ type: "turn_started", provider: CODEX_PROVIDER });
+      return;
+    }
+    this.deferredExternalTurn = false;
+    this.lastExternalIdleAt = Date.now();
+    if (!this.externalTurnOpen) {
+      return;
+    }
+    this.externalTurnOpen = false;
+    if (state === "superseded") {
+      // The daemon is about to run this turn itself; emitting turn_completed
+      // here would race the foreground turn's own events.
+      return;
+    }
+    this.notifySubscribers({
+      type: "turn_completed",
+      provider: CODEX_PROVIDER,
+      usage: this.latestUsage,
+    });
+  }
+
+  isExternalTurnActive(): boolean {
+    return this.externalTurnOpen;
+  }
+
+  private openDeferredExternalTurn(): void {
+    if (!this.deferredExternalTurn || this.activeForegroundTurnId || this.externalTurnOpen) {
+      return;
+    }
+    this.deferredExternalTurn = false;
+    this.externalTurnOpen = true;
+    this.notifySubscribers({ type: "turn_started", provider: CODEX_PROVIDER });
+  }
+
+  /** See startTurn: a daemon turn supersedes an open external turn, and its
+   * prompt is recorded so the pane's transcript echo renders once. */
+  private beginForegroundOverExternalTurn(prompt: AgentPromptInput): void {
+    if (this.externalTurnOpen) {
+      this.noteExternalTurn("idle");
+    }
+    if (this.isExternallyDriven()) {
+      this.externalEchoes.record(promptEchoText(prompt));
+    }
+  }
+
+  externalTranscriptPath(): string | null {
+    const threadId = this.currentThreadId ?? this.resumeHandle?.sessionId ?? null;
+    if (!threadId) {
+      return null;
+    }
+    if (this.cachedExternalTranscriptPath?.includes(threadId)) {
+      return this.cachedExternalTranscriptPath;
+    }
+    this.cachedExternalTranscriptPath = resolveCodexRolloutPath(threadId);
+    return this.cachedExternalTranscriptPath;
+  }
+
+  ingestExternalTranscriptLines(content: string): void {
+    for (const line of content.split(/\r?\n/)) {
+      const signal = parseCodexRolloutLine(line);
+      if (!signal) {
+        continue;
+      }
+      switch (signal.kind) {
+        case "turn_started":
+          this.noteExternalTurn("running");
+          break;
+        case "turn_completed":
+          this.noteExternalTurn("idle");
+          break;
+        case "item": {
+          const entries = threadItemToTimelineEntries(signal.item, {
+            cwd: this.config.cwd ?? null,
+          });
+          if (entries.length === 0) {
+            break;
+          }
+          // Lines arriving for a turn nobody reported means work is happening
+          // in the pane; open the turn before the rows go out.
+          this.noteExternalTurn("activity");
+          for (const item of entries) {
+            if (item.type === "user_message" && this.externalEchoes.consume(item.text)) {
+              continue;
+            }
+            this.notifySubscribers({ type: "timeline", provider: CODEX_PROVIDER, item });
+          }
+          break;
+        }
+      }
+    }
+  }
+
   async close(): Promise<void> {
     this.closed = true;
+    this.externalTurnOpen = false;
+    this.deferredExternalTurn = false;
     this.clearPendingPermissions();
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.subscribers.clear();
@@ -5575,6 +5754,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.pendingForegroundTurnIdentification = null;
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.resetTurnTrackingState();
+    // FORK: an external turn reported while this turn ran was deferred, not dropped.
+    this.openDeferredExternalTurn();
   }
 
   private resetTurnTrackingState(): void {
