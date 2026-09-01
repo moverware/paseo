@@ -4,6 +4,7 @@ import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
 import { runArchiveCommand } from "./archive.js";
 import { runCreateCommand } from "./create.js";
 import { runLsCommand } from "./ls.js";
+import { runUnarchiveCommand } from "./unarchive.js";
 
 export function createWorkspaceCommand(): Command {
   const workspace = new Command("workspace").description("Manage workspaces");
@@ -38,6 +39,13 @@ export function createWorkspaceCommand(): Command {
       .description("Archive a workspace and everything it owns")
       .argument("<workspace-id>", "Workspace id"),
   ).action(withOutput(runArchiveCommand));
+
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("unarchive")
+      .description("Restore an archived workspace (workspace.recovery.restore)")
+      .argument("<workspace-id>", "Workspace id"),
+  ).action(withOutput(runUnarchiveCommand));
 
   return workspace;
 }
