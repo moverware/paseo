@@ -97,8 +97,10 @@ export function toStoredAgentRecord(
   } satisfies StoredAgentRecord;
 }
 
-// FORK: see the title line in toAgentPayload.
-function decorateTitleWithExternalActivity(
+// FORK: see the title line in toAgentPayload. Exported because
+// enrichAgentPayload re-resolves the title from storage AFTER projection and
+// must re-apply the decoration it just overwrote.
+export function decorateTitleWithExternalActivity(
   title: string | null,
   externalActivity: string | undefined,
 ): string | null {

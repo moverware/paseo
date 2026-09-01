@@ -96,6 +96,7 @@ import {
   buildStoredAgentPayload,
   resolveStoredAgentPayloadUpdatedAt,
   toAgentPayload,
+  decorateTitleWithExternalActivity,
 } from "./agent/agent-projections.js";
 import {
   appendTimelineItemIfAgentKnown,
@@ -1706,7 +1707,12 @@ export class Session {
 
   private async enrichAgentPayload(payload: AgentSnapshotPayload): Promise<AgentSnapshotPayload> {
     const storedRecord = await this.agentStorage.get(payload.id);
-    payload.title = storedRecord?.title ?? null;
+    // FORK: keep the external-activity title decoration this override would
+    // otherwise erase (the official app renders no other live text surface).
+    payload.title = decorateTitleWithExternalActivity(
+      storedRecord?.title ?? null,
+      payload.externalActivity,
+    );
     payload.archivedAt = storedRecord?.archivedAt ?? null;
     return payload;
   }
