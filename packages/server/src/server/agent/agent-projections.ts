@@ -117,6 +117,7 @@ export function toAgentPayload(
     thinkingOptionId,
     effectiveThinkingOptionId,
     ...(runtimeInfo ? { runtimeInfo } : {}),
+    ...(agent.externalActivity ? { externalActivity: agent.externalActivity } : {}),
     createdAt: agent.createdAt.toISOString(),
     updatedAt: agent.updatedAt.toISOString(),
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,

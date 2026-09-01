@@ -1996,6 +1996,7 @@ export class Session {
           msg.name,
           msg.labels,
           msg.externalTurn,
+          msg.externalActivity,
           msg.requestId,
         );
       case "project.rename.request":
@@ -2614,6 +2615,7 @@ export class Session {
     name: string | undefined,
     labels: Record<string, string> | undefined,
     externalTurn: "running" | "idle" | undefined,
+    externalActivity: string | undefined,
     requestId: string,
   ): Promise<void> {
     this.sessionLogger.info(
@@ -2631,7 +2633,7 @@ export class Session {
       // FORK: a turn running in a process the daemon does not own reports its
       // own boundaries here. Handled before updateAgentCommand so a report
       // that carries no name or labels is still a complete request.
-      if (externalTurn) {
+      if (externalTurn || externalActivity !== undefined) {
         // Load first: reports are a no-op for an agent the daemon has not
         // loaded, which is every agent after a restart — the pane would work
         // visibly while the client read idle, and the transcript tailer would
@@ -2647,7 +2649,12 @@ export class Session {
             "external turn report could not load its agent",
           );
         });
-        this.agentManager.reportExternalTurn(agentId, externalTurn);
+        if (externalTurn) {
+          this.agentManager.reportExternalTurn(agentId, externalTurn);
+        }
+        if (externalActivity !== undefined) {
+          this.agentManager.reportExternalActivity(agentId, externalActivity);
+        }
         if (!name?.trim() && !(labels && Object.keys(labels).length > 0)) {
           this.emit({
             type: "update_agent_response",

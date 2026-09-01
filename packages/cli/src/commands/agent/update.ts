@@ -36,6 +36,7 @@ export interface AgentUpdateOptions extends CommandOptions {
   label?: string[];
   thinking?: string;
   externalTurn?: string;
+  externalActivity?: string;
   host?: string;
 }
 
@@ -45,6 +46,7 @@ export interface AgentMetadataChanges {
   name?: string;
   labels?: Record<string, string>;
   externalTurn?: "running" | "idle";
+  externalActivity?: string;
 }
 
 interface AgentUpdateServerInfo {
@@ -185,9 +187,13 @@ function parseAgentChanges(options: AgentUpdateOptions): AgentChanges {
   }
 
   const externalTurn = parseExternalTurnOption(options.externalTurn);
+  const externalActivity = options.externalActivity?.trim();
 
   const hasMetadataUpdates =
-    Boolean(name) || Object.keys(labels).length > 0 || Boolean(externalTurn);
+    Boolean(name) ||
+    Object.keys(labels).length > 0 ||
+    Boolean(externalTurn) ||
+    externalActivity !== undefined;
   if (hasMetadataUpdates && thinkingOptionId) {
     throw {
       code: "INVALID_OPTIONS",
@@ -210,6 +216,7 @@ function parseAgentChanges(options: AgentUpdateOptions): AgentChanges {
   return {
     type: "metadata",
     updates: {
+      ...(externalActivity !== undefined ? { externalActivity } : {}),
       ...(name ? { name } : {}),
       ...(Object.keys(labels).length > 0 ? { labels } : {}),
       ...(externalTurn ? { externalTurn } : {}),

@@ -2559,6 +2559,7 @@ export class DaemonClient {
       name?: string;
       labels?: Record<string, string>;
       externalTurn?: "running" | "idle";
+      externalActivity?: string;
     },
   ): Promise<void> {
     const requestId = this.createRequestId();
@@ -2570,6 +2571,9 @@ export class DaemonClient {
         ? { labels: updates.labels }
         : {}),
       ...(updates.externalTurn !== undefined ? { externalTurn: updates.externalTurn } : {}),
+      ...(updates.externalActivity !== undefined
+        ? { externalActivity: updates.externalActivity }
+        : {}),
       requestId,
     });
     const payload = await this.sendRequest({

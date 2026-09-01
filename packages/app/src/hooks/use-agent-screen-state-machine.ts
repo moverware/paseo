@@ -23,6 +23,7 @@ export interface AgentScreenAgent {
   } | null;
   features?: readonly AgentFeature[];
   lastError?: string | null;
+  externalActivity?: string;
   projectPlacement?: {
     projectKey?: string;
     projectName?: string;

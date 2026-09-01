@@ -105,6 +105,10 @@ export function createAgentCommand(): Command {
       .option(
         "--external-turn <state>",
         "Report the state of a turn running outside the daemon: running or idle",
+      )
+      .option(
+        "--external-activity <text>",
+        "Live one-line activity readout from the external process's UI (transient; cleared when the turn ends)",
       ),
   ).action(withOutput(runUpdateCommand));
 

@@ -129,6 +129,8 @@ export interface Agent {
   runtimeInfo?: AgentRuntimeInfo;
   lastUsage?: AgentUsage;
   lastError?: string | null;
+  /** Live one-line readout from an externally-driven turn's own UI. */
+  externalActivity?: string;
   title: string | null;
   cwd: string;
   workspaceId?: string;

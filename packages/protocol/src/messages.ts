@@ -754,6 +754,9 @@ export const AgentSnapshotPayloadSchema = z.object({
   pendingPermissions: z.array(AgentPermissionRequestPayloadSchema),
   persistence: AgentPersistenceHandleSchema.nullable(),
   runtimeInfo: AgentRuntimeInfoSchema.optional(),
+  // See update_agent_request.externalActivity — present only while an
+  // externally-driven turn runs and a reporter is feeding it.
+  externalActivity: z.string().optional(),
   lastUsage: AgentUsageSchema.optional(),
   lastError: z.string().optional(),
   title: z.string().nullable(),
@@ -864,6 +867,10 @@ export const UpdateAgentRequestMessageSchema = z.object({
   // provider CLI in a terminal pane): "running" with each prompt/tool use,
   // "idle" when the turn ends. Projects into the agent's status.
   externalTurn: z.enum(["running", "idle"]).optional(),
+  // Live one-line activity readout from the external process's UI (elapsed,
+  // token counter, current verb) — shown while the turn runs so a long
+  // silent stretch is distinguishable from a hang. Transient; never persisted.
+  externalActivity: z.string().max(300).optional(),
   requestId: z.string(),
 });
 

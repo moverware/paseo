@@ -358,6 +358,9 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  /** FORK: live one-line readout from an external process's UI while its
+   * turn runs (see update_agent_request.externalActivity). Transient. */
+  externalActivity?: string;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
@@ -859,6 +862,10 @@ export class AgentManager {
    * 2026-08-14). The tail or the next heartbeat re-marks the turn running.
    */
   releaseExternalTurn(agentId: string): boolean {
+    const releasing = this.agents.get(agentId);
+    if (releasing?.externalActivity) {
+      releasing.externalActivity = undefined;
+    }
     const agent = this.agents.get(agentId);
     if (!agent || agent.session.isExternalTurnActive?.() !== true) {
       return false;
@@ -2084,7 +2091,30 @@ export class AgentManager {
    * all move through the same path a daemon-run turn uses.
    */
   reportExternalTurn(agentId: string, state: "running" | "idle"): void {
-    this.agents.get(agentId)?.session.noteExternalTurn?.(state);
+    const agent = this.agents.get(agentId);
+    agent?.session.noteExternalTurn?.(state);
+    if (agent && state === "idle" && agent.externalActivity) {
+      agent.externalActivity = undefined;
+      this.emitState(agent);
+    }
+  }
+
+  /**
+   * FORK: live activity readout for an externally-driven turn — what the
+   * pane's own UI shows (verb, elapsed, token counter). Broadcast so clients
+   * can tell a long silent stretch from a hang; cleared when the turn ends.
+   */
+  reportExternalActivity(agentId: string, text: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      return;
+    }
+    const trimmed = text.trim().slice(0, 300) || undefined;
+    if (agent.externalActivity === trimmed) {
+      return;
+    }
+    agent.externalActivity = trimmed;
+    this.emitState(agent);
   }
 
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
