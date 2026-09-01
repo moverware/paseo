@@ -473,6 +473,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     noteExternalIdentity: inner.noteExternalIdentity?.bind(inner),
     noteExternalTurn: inner.noteExternalTurn?.bind(inner),
     isExternalTurnActive: inner.isExternalTurnActive?.bind(inner),
+    forceReleaseHungRuntime: inner.forceReleaseHungRuntime?.bind(inner),
   };
 }
 

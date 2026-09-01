@@ -169,6 +169,37 @@ describe("Claude runtime exit", () => {
     }
   });
 
+  // FORK: last-resort stop for a runtime wedged in an unkillable syscall —
+  // see AgentSession.forceReleaseHungRuntime.
+  test("forceReleaseHungRuntime kills the child tree and reports whether it had one", async () => {
+    let capturedOptions: Options | undefined;
+    const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
+      capturedOptions = options;
+      return createQueryMock(COMPLETED_TURN_EVENTS);
+    });
+    const child = createChildProcessStub();
+    vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(child);
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+
+    try {
+      // No runtime yet: nothing to kill, and no signals are sent.
+      expect(await session.forceReleaseHungRuntime?.()).toBe(false);
+
+      await session.run("start something");
+      capturedOptions?.spawnClaudeCodeProcess?.(SPAWN_OPTIONS);
+
+      expect(await session.forceReleaseHungRuntime?.()).toBe(true);
+      expect(child.killSignals.length).toBeGreaterThan(0);
+    } finally {
+      await session.close();
+    }
+  });
+
   test("fails a running workflow when its idle Claude runtime exits", async () => {
     let capturedOptions: Options | undefined;
     const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {

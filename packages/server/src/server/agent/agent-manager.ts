@@ -2520,6 +2520,21 @@ export class AgentManager {
     });
 
     if (!interruptAcknowledged) {
+      // FORK: an interrupt that cannot settle is usually a provider runtime
+      // wedged in an unkillable syscall; refusing here left the turn running
+      // forever and the stop button dead (2026-09-01). Kill the runtime — its
+      // exit path fails the turn — and give the run a moment to settle.
+      if (settlement !== "completed" && (await agent.session.forceReleaseHungRuntime?.())) {
+        const rescued = await this.waitWithTimeout({
+          operation: run.settledPromise,
+          timeoutMs: this.rescueTimeouts.interruptSessionMs,
+        });
+        this.logger.warn(
+          { agentId, kind: run.kind, rescued },
+          "cancelAgentRun: interrupt did not settle — hung runtime killed",
+        );
+        return { status: rescued === "completed" ? "settled" : "refused" };
+      }
       return { status: settlement === "completed" ? "settled" : "refused" };
     }
 

@@ -673,6 +673,15 @@ export interface AgentSession {
    * the labels change.
    */
   noteExternalIdentity?(identity: { agentId: string; labels: Record<string, string> }): void;
+
+  /**
+   * Last-resort stop: the session's interrupt could not settle, usually a
+   * provider runtime wedged in an unkillable syscall (2026-09-01: a Bash tool
+   * hung on an unreachable mount held a turn for 14 minutes past its stop).
+   * Kill the runtime so its exit path fails the turn. Returns true when a
+   * kill was attempted, false when there is nothing to kill.
+   */
+  forceReleaseHungRuntime?(): Promise<boolean>;
   /**
    * Drive this session's autonomous turn on behalf of a process the daemon
    * does not run. "running" opens one (the manager's normal turn_started

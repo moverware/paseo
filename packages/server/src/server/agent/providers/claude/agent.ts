@@ -4246,6 +4246,28 @@ class ClaudeAgentSession implements AgentSession {
     return true;
   }
 
+  /**
+   * FORK: see AgentSession.forceReleaseHungRuntime. Killing the child routes
+   * through handleRuntimeExit / the query pump, which fail the active turn
+   * with the real cause and drop the dead transport — the same path an
+   * organic crash takes, so no state is cleaned twice.
+   */
+  async forceReleaseHungRuntime(): Promise<boolean> {
+    const child = this.childProcess;
+    if (!child) {
+      return false;
+    }
+    this.logger.warn(
+      { agentId: this.agentId, pid: child.pid, sessionId: this.claudeSessionId },
+      "Force-killing hung Claude runtime after interrupt failed to settle",
+    );
+    await terminateWithTreeKill(child, {
+      gracefulTimeoutMs: 2_000,
+      forceTimeoutMs: 2_000,
+    });
+    return true;
+  }
+
   private async interruptActiveTurn(): Promise<void> {
     const queryToInterrupt = this.query;
     if (!queryToInterrupt || typeof queryToInterrupt.interrupt !== "function") {
