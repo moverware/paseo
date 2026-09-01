@@ -34,6 +34,7 @@ export interface AgentListItem {
   cwd: string;
   created: string;
   sessionId: string | null;
+  externalActivity: string | null;
   workspaceId: string | null;
   labels: Record<string, string>;
   archivedAt: string | null;
@@ -104,6 +105,7 @@ function toListItem(agent: AgentSnapshotPayload): AgentListItem {
     cwd: shortenPath(agent.cwd),
     created: relativeTime(agent.createdAt),
     sessionId: agent.persistence?.sessionId ?? agent.runtimeInfo?.sessionId ?? null,
+    externalActivity: agent.externalActivity ?? null,
     workspaceId: agent.workspaceId ?? null,
     labels: agent.labels ?? {},
     archivedAt: agent.archivedAt ?? null,
