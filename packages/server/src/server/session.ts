@@ -1187,6 +1187,30 @@ export class Session {
     await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
   }
 
+  // FORK: see the call in handleFetchWorkspacesRequest.
+  private emitArchivedWorkspaceRemovals(): void {
+    void (async () => {
+      try {
+        const rows = await this.workspaceRegistry.list();
+        const archived = rows.filter((row) => row.archivedAt).slice(0, 200);
+        for (const row of archived) {
+          this.emit({
+            type: "workspace_update",
+            payload: { kind: "remove", id: row.workspaceId },
+          });
+        }
+        if (archived.length > 0) {
+          this.sessionLogger.debug(
+            { count: archived.length },
+            "swept archived workspace removals to client",
+          );
+        }
+      } catch (error) {
+        this.sessionLogger.warn({ err: error }, "archived workspace removal sweep failed");
+      }
+    })();
+  }
+
   async emitWorkspaceUpdateForWorkspaceId(workspaceId: string): Promise<void> {
     await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
   }
@@ -5258,6 +5282,12 @@ export class Session {
 
       if (subscriptionId && this.workspaceUpdatesSubscription?.subscriptionId === subscriptionId) {
         this.flushBootstrappedWorkspaceUpdates(snapshot);
+        // FORK: the official app merges workspace rows upsert-only, so a row
+        // that vanishes while it is disconnected (the daemon-down reconcile
+        // tombstones swept rows) ghosts in its sidebar forever. Removes for
+        // ids a client never knew are ignored, so sweeping every archived id
+        // at bootstrap converges every client cheaply.
+        this.emitArchivedWorkspaceRemovals();
       }
     } catch (error) {
       if (subscriptionId && this.workspaceUpdatesSubscription?.subscriptionId === subscriptionId) {
@@ -6076,7 +6106,24 @@ export class Session {
     try {
       const existing = await this.workspaceRegistry.get(request.workspaceId);
       if (!existing) {
-        throw new Error(`Workspace not found: ${request.workspaceId}`);
+        // FORK: archiving an id the daemon no longer knows succeeds. The
+        // official app merges rows upsert-only, so a row deleted while it
+        // was disconnected ghosts in its sidebar; erroring here would leave
+        // no way to clear one from the phone. Ack and confirm the removal.
+        this.emit({
+          type: "workspace_update",
+          payload: { kind: "remove", id: request.workspaceId },
+        });
+        this.emit({
+          type: "archive_workspace_response",
+          payload: {
+            requestId: request.requestId,
+            workspaceId: request.workspaceId,
+            archivedAt: new Date().toISOString(),
+            error: null,
+          },
+        });
+        return;
       }
 
       await archiveByScope(
