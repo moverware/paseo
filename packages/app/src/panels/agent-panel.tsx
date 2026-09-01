@@ -117,7 +117,6 @@ interface ChatAgentStateShape {
   runtimeInfo?: Agent["runtimeInfo"];
   features?: Agent["features"];
   lastError?: Agent["lastError"] | null;
-  externalActivity?: Agent["externalActivity"];
 }
 
 const RECONNECT_TOAST_DELAY_MS = 1_000;
@@ -172,7 +171,6 @@ function selectChatAgentState(
     runtimeInfo: agent.runtimeInfo,
     features: agent.features,
     lastError: agent.lastError ?? null,
-    externalActivity: agent.externalActivity,
     archivedAt: agent.archivedAt ?? null,
     requiresAttention: agent.requiresAttention ?? false,
     attentionReason: agent.attentionReason ?? null,
@@ -200,7 +198,6 @@ function buildChatAgentFromState(
     runtimeInfo: state.runtimeInfo,
     features: state.features,
     lastError: state.lastError ?? null,
-    externalActivity: state.externalActivity,
     projectPlacement,
   };
 }

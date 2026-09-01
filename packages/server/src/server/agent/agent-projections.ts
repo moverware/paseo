@@ -97,6 +97,18 @@ export function toStoredAgentRecord(
   } satisfies StoredAgentRecord;
 }
 
+// FORK: see the title line in toAgentPayload.
+function decorateTitleWithExternalActivity(
+  title: string | null,
+  externalActivity: string | undefined,
+): string | null {
+  if (!externalActivity) {
+    return title;
+  }
+  const decoration = `⚙ ${externalActivity}`.slice(0, 80);
+  return title ? `${title} · ${decoration}` : decoration;
+}
+
 export function toAgentPayload(
   agent: ManagedAgent,
   options?: ProjectionOptions,
@@ -134,7 +146,12 @@ export function toAgentPayload(
     features: normalizeFeatures(agent.features),
     pendingPermissions: sanitizePendingPermissions(agent.pendingPermissions),
     persistence: projectPersistenceHandleForWire(agent.persistence),
-    title: options?.title ?? null,
+    // FORK: the official app renders no dedicated activity surface, but it
+    // renders the title live in the thread header and sidebar — so an
+    // external turn's activity readout decorates the title at projection
+    // time only. The stored name stays clean and the decoration disappears
+    // the moment the activity clears.
+    title: decorateTitleWithExternalActivity(options?.title ?? null, agent.externalActivity),
     labels: agent.labels,
   };
 

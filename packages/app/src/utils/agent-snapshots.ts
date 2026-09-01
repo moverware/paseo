@@ -65,7 +65,6 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     runtimeInfo: snapshot.runtimeInfo,
     lastUsage: snapshot.lastUsage,
     lastError: snapshot.lastError ?? null,
-    externalActivity: snapshot.externalActivity,
     title: snapshot.title ?? null,
     cwd: snapshot.cwd,
     workspaceId: snapshot.workspaceId,

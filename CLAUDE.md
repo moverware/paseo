@@ -110,6 +110,14 @@ terminal panes. The fork exists because upstream assumes the daemon _runs_ the
 agents, and here it usually doesn't — the pane does, and the daemon is a
 renderer and remote control over it.
 
+**The phone runs the OFFICIAL App Store build of the paseo app.** There is
+no custom app distribution: nothing in `packages/app` ever reaches
+Mitchell's phone, so a fork change that needs new app rendering code is dead
+on arrival. Phone-visible behavior must ride surfaces the official app
+already renders — agent name/title, status and turn state, timeline events,
+attention states. (`packages/app` edits are still fine for upstream PRs or
+the web/desktop clients run from this checkout.)
+
 **Priority order for any change here.**
 
 1. **Mitchell's system works.** He drives real work from his phone; a broken

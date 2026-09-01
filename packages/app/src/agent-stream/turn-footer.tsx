@@ -1,5 +1,5 @@
 import React, { memo, useCallback, useMemo, type ReactNode } from "react";
-import { Text, View } from "react-native";
+import { View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { MAX_CONTENT_WIDTH } from "@/constants/layout";
 import type { Theme } from "@/styles/theme";
@@ -44,7 +44,6 @@ export type InFlightTurnForkHandler = (target: AssistantForkTarget) => Promise<v
 export const TurnFooter = memo(function TurnFooter({
   isRunning,
   inFlightTurnStartedAt,
-  externalActivity = null,
   host,
   strategy,
   supportsTimelineCursor,
@@ -53,7 +52,6 @@ export const TurnFooter = memo(function TurnFooter({
 }: {
   isRunning: boolean;
   inFlightTurnStartedAt: Date | null;
-  externalActivity?: string | null;
   host: TurnFooterHost | null;
   strategy: TurnContentStrategy;
   supportsTimelineCursor: boolean;
@@ -65,7 +63,6 @@ export const TurnFooter = memo(function TurnFooter({
       <TurnFooterRow>
         <RunningTurnFooter
           inFlightTurnStartedAt={inFlightTurnStartedAt}
-          externalActivity={externalActivity}
           onForkInFlightTurn={onForkInFlightTurn}
         />
       </TurnFooterRow>
@@ -117,11 +114,9 @@ export const CompletedTurnFooterRow = memo(function CompletedTurnFooterRow({
 
 const WorkingIndicator = memo(function WorkingIndicator({
   inFlightTurnStartedAt = null,
-  externalActivity = null,
   onForkInFlightTurn,
 }: {
   inFlightTurnStartedAt?: Date | null;
-  externalActivity?: string | null;
   onForkInFlightTurn?: InFlightTurnForkHandler;
 }) {
   const active = useRetainedPanelActive();
@@ -140,29 +135,21 @@ const WorkingIndicator = memo(function WorkingIndicator({
           testID="turn-working-elapsed"
         />
       ) : null}
-      {externalActivity ? (
-        <Text style={stylesheet.workingActivity} numberOfLines={1} testID="turn-working-activity">
-          {externalActivity}
-        </Text>
-      ) : null}
     </View>
   );
 });
 
 function RunningTurnFooter({
   inFlightTurnStartedAt,
-  externalActivity = null,
   onForkInFlightTurn,
 }: {
   inFlightTurnStartedAt: Date | null;
-  externalActivity?: string | null;
   onForkInFlightTurn?: InFlightTurnForkHandler;
 }) {
   return (
     <View style={stylesheet.turnFooterSlot} testID="turn-working-indicator">
       <WorkingIndicator
         inFlightTurnStartedAt={inFlightTurnStartedAt}
-        externalActivity={externalActivity}
         onForkInFlightTurn={onForkInFlightTurn}
       />
     </View>
@@ -252,13 +239,6 @@ const stylesheet = StyleSheet.create((theme) => ({
     color: theme.colors.foregroundMuted,
     fontSize: STREAM_METADATA_FONT_SIZE,
     fontVariant: ["tabular-nums"],
-  },
-  // The external pane's own ticker (verb · elapsed · token counter) — proof
-  // of life during long silent stretches. Shrinks before its neighbors do.
-  workingActivity: {
-    color: theme.colors.foregroundMuted,
-    fontSize: STREAM_METADATA_FONT_SIZE,
-    flexShrink: 1,
   },
   workingLoader: {
     marginLeft: -2,

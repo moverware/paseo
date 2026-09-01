@@ -857,7 +857,6 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           <TurnFooter
             isRunning={isTurnActive}
             inFlightTurnStartedAt={baseRenderModel.turnTiming.runningStartedAt}
-            externalActivity={context.externalActivity ?? null}
             host={bottomTurnFooterHost}
             strategy={streamRenderStrategy}
             supportsTimelineCursor={supportsAgentForkContextCursor}
@@ -871,7 +870,6 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         readOnly,
         isTurnActive,
         baseRenderModel.turnTiming.runningStartedAt,
-        context.externalActivity,
         bottomTurnFooterHost,
         streamRenderStrategy,
         supportsAgentForkContextCursor,
@@ -1092,7 +1090,6 @@ function collectAgentScreenAgentDiffs(left: AgentScreenAgent, right: AgentScreen
     reasons.push("agent.capabilities");
   }
   if (left.lastError !== right.lastError) reasons.push("agent.lastError");
-  if (left.externalActivity !== right.externalActivity) reasons.push("agent.externalActivity");
   reasons.push(...collectAgentSetupDiffs(left, right));
   reasons.push(...collectAgentProjectPlacementDiffs(left.projectPlacement, right.projectPlacement));
   return reasons;
