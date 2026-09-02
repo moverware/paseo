@@ -42,6 +42,8 @@ import {
   parseClaudeCodeVersion,
   resolveClaudeDisabledThinkingForModel,
 } from "./model-manifest.js";
+// FORK: [1m] suffix for pool-authed spawns.
+import { applyFableOneMillionSuffix } from "./fable-context-suffix.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import { ClaudeTaskState } from "./task-state.js";
@@ -3693,6 +3695,9 @@ class ClaudeAgentSession implements AgentSession {
       base.model = this.config.model;
     }
     this.lastOptionsModel = base.model ?? null;
+    // FORK: see fable-context-suffix.ts — bookkeeping above stays on the
+    // canonical id; only the spawned process sees the suffixed one.
+    base.model = applyFableOneMillionSuffix(base.model, sdkEnv);
     if (this.claudeSessionId && !this.pendingFreshSessionId) {
       base.resume = this.claudeSessionId;
     }
