@@ -129,6 +129,11 @@ the web/desktop clients run from this checkout.)
    ours — even if ours is marginally nicer. Prefer additive seams (new files,
    new optional interface members, config keys) over edits inside upstream
    functions, because those rebase cleanly.
+3. **Stay current with upstream.** Merge the latest upstream release tag —
+   not main tip — whenever a needed capability landed upstream or a release
+   or two of drift has built up. Small frequent merges beat rare giant ones,
+   and never cherry-pick around a merge that is due: a cherry-pick leaves the
+   drift in place and adds a conflict to the eventual merge.
 
 Concretely: before adding to this fork, check whether upstream already has the
 capability or would accept the change; if a patch must edit an upstream
