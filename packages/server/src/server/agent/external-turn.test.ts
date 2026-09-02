@@ -255,7 +255,7 @@ describe("external turns in the agent manager", () => {
     // The external process's own prompt hook is what interrupts the pane while
     // it delivers this prompt; a daemon-side interrupt would race its keystrokes.
     expect(fixture.session.interruptCount).toBe(0);
-    expect(result.outOfBand).toBe(false);
+    expect(result.disposition).toBe("turn_started");
     expect(fixture.session.startedPrompts).toEqual(["from the phone"]);
     expect(fixture.session.isExternalTurnActive()).toBe(false);
   });

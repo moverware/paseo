@@ -26,6 +26,7 @@ export interface PiRuntimeLaunch {
 
 export interface PiStartSessionInput {
   cwd: string;
+  signal?: AbortSignal;
   env?: Record<string, string>;
   protocolMode?: "rpc" | "rpc-ui";
   model?: string;
@@ -44,6 +45,11 @@ export interface PiRuntimeSession {
     message: string,
     images?: Array<{ type: "image"; data: string; mimeType: string }>,
   ): Promise<PiPromptAck>;
+  steer(
+    message: string,
+    images?: Array<{ type: "image"; data: string; mimeType: string }>,
+  ): Promise<void>;
+  clearQueue(): Promise<void>;
   compact(customInstructions?: string): Promise<void>;
   setAutoCompaction(enabled: boolean): Promise<void>;
   abort(): Promise<void>;

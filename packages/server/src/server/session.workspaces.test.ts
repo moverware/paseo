@@ -18,6 +18,7 @@ import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { Session } from "./session.js";
 import type { SessionOptions } from "./session.js";
+import { OWNER_PERMISSIONS } from "./authorization/index.js";
 import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-service.js";
 import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
@@ -53,10 +54,8 @@ import {
   asAgentManager,
   asAgentStorage,
   asDownloadTokenStore,
-  asPushTokenStore,
-  asChatService,
+  asPushNotifications,
   asScheduleService,
-  asLoopService,
   asCheckoutDiffManager,
   asDaemonConfigStore,
   asTerminalManager,
@@ -635,13 +634,13 @@ function createSessionForWorkspaceTests(
   const session = asTestSession(
     new Session({
       clientId: "test-client",
-      scopes: ["*"],
+      permissions: OWNER_PERMISSIONS,
       appVersion: options.appVersion ?? null,
       onMessage: options.onMessage ?? vi.fn(),
       onWorkspaceRecovered: options.onWorkspaceRecovered,
       logger: asSessionLogger(logger),
       downloadTokenStore: asDownloadTokenStore(),
-      pushTokenStore: asPushTokenStore(),
+      pushNotifications: asPushNotifications(),
       paseoHome: options.paseoHome ?? "/tmp/paseo-test",
       worktreesRoot: options.worktreesRoot,
       agentManager,
@@ -692,9 +691,7 @@ function createSessionForWorkspaceTests(
       },
       workspaceRegistry,
       filesystem: { isDirectory: async () => true },
-      chatService: asChatService(),
       scheduleService: asScheduleService(),
-      loopService: asLoopService(),
       checkoutDiffManager: asCheckoutDiffManager({
         subscribe: async () => ({
           initial: { cwd: "/tmp", files: [], error: null },
@@ -739,6 +736,55 @@ function createSessionForWorkspaceTests(
   );
   return session;
 }
+
+test("project.list.request catches up by sequence on the existing RPC", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  let project = createPersistedProjectRecord({
+    projectId: "project-sequenced",
+    rootPath: "/repo/sequenced",
+    kind: "git",
+    displayName: "Before",
+    createdAt: "2026-08-12T08:00:00.000Z",
+    updatedAt: "2026-08-12T08:00:00.000Z",
+  });
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    projectRegistry: {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      list: async () => [project],
+      get: async () => project,
+      getOrCreateActiveByRoot: async () => project,
+      upsert: async () => {},
+      archive: async () => {},
+      remove: async () => {},
+    },
+  });
+
+  await session.handleMessage({
+    type: "project.list.request",
+    requestId: "initial",
+    sync: {},
+  });
+  const initial = findByType(emitted, "project.list.response")?.payload;
+  expect(initial?.sync).toMatchObject({ mode: "snapshot", headSeq: 1 });
+
+  project = { ...project, displayName: "After", updatedAt: "2026-08-12T08:01:00.000Z" };
+  await session.handleMessage({
+    type: "project.list.request",
+    requestId: "catch-up",
+    sync: {
+      generation: initial?.sync?.generation,
+      afterSeq: initial?.sync?.headSeq,
+    },
+  });
+  const responses = filterByType(emitted, "project.list.response");
+  expect(responses.at(-1)?.payload).toMatchObject({
+    requestId: "catch-up",
+    projects: [{ projectId: "project-sequenced", projectDisplayName: "After", syncSeq: 2 }],
+    sync: { mode: "changes", headSeq: 2, removals: [] },
+  });
+});
 
 test("agent updates preserve queued live transitions across stored metadata reads", async () => {
   const running = makeManagedAgent({
@@ -945,20 +991,18 @@ test("create_agent_request keeps requested child cwd when grouped under an exist
       new Session({
         clientId: "test-client",
         serverId: "test-server",
-        scopes: ["*"],
+        permissions: OWNER_PERMISSIONS,
         appVersion: null,
         onMessage: (message) => emitted.push(message),
         logger: asSessionLogger(logger),
         downloadTokenStore: asDownloadTokenStore(),
-        pushTokenStore: asPushTokenStore(),
+        pushNotifications: asPushNotifications(),
         paseoHome: path.join(workdir, "paseo-home"),
         agentManager,
         agentStorage,
         projectRegistry,
         workspaceRegistry,
-        chatService: asChatService(),
         scheduleService: asScheduleService(),
-        loopService: asLoopService(),
         checkoutDiffManager: asCheckoutDiffManager({
           subscribe: async () => ({
             initial: { cwd: child, files: [], error: null },
@@ -1099,20 +1143,18 @@ test("create_agent_request launches from an exact subdirectory in a created work
     const emitted: SessionOutboundMessage[] = [];
     const session = new Session({
       clientId: "test-client",
-      scopes: ["*"],
+      permissions: OWNER_PERMISSIONS,
       appVersion: null,
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(logger),
       downloadTokenStore: asDownloadTokenStore(),
-      pushTokenStore: asPushTokenStore(),
+      pushNotifications: asPushNotifications(),
       paseoHome: path.join(workdir, "paseo-home"),
       agentManager,
       agentStorage,
       projectRegistry,
       workspaceRegistry,
-      chatService: asChatService(),
       scheduleService: asScheduleService(),
-      loopService: asLoopService(),
       checkoutDiffManager: asCheckoutDiffManager({
         subscribe: async () => ({
           initial: { cwd: child, files: [], error: null },
@@ -1238,20 +1280,18 @@ test("create_agent_request does not title an existing workspace from the agent p
     const session = asTestSession(
       new Session({
         clientId: "test-client",
-        scopes: ["*"],
+        permissions: OWNER_PERMISSIONS,
         appVersion: null,
         onMessage: vi.fn(),
         logger: asSessionLogger(logger),
         downloadTokenStore: asDownloadTokenStore(),
-        pushTokenStore: asPushTokenStore(),
+        pushNotifications: asPushNotifications(),
         paseoHome: path.join(workdir, "paseo-home"),
         agentManager,
         agentStorage,
         projectRegistry,
         workspaceRegistry,
-        chatService: asChatService(),
         scheduleService: asScheduleService(),
-        loopService: asLoopService(),
         checkoutDiffManager: asCheckoutDiffManager({
           subscribe: async () => ({
             initial: { cwd, files: [], error: null },
@@ -1509,11 +1549,11 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
   const session = asTestSession(
     new Session({
       clientId: "test-client",
-      scopes: ["*"],
+      permissions: OWNER_PERMISSIONS,
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(logger),
       downloadTokenStore: asDownloadTokenStore(),
-      pushTokenStore: asPushTokenStore(),
+      pushNotifications: asPushNotifications(),
       paseoHome: "/tmp/paseo-test",
       agentManager: asAgentManager({
         subscribe: () => () => {},
@@ -1580,9 +1620,7 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
           remove: async () => {},
         };
       })(),
-      chatService: asChatService(),
       scheduleService: asScheduleService(),
-      loopService: asLoopService(),
       checkoutDiffManager: asCheckoutDiffManager({
         subscribe: async () => ({
           initial: { cwd: REPO_CWD, files: [], error: null },
@@ -1876,11 +1914,11 @@ test("close_items_request archives agents and kills terminals in one batch", asy
   const session = asTestSession(
     new Session({
       clientId: "test-client",
-      scopes: ["*"],
+      permissions: OWNER_PERMISSIONS,
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(sessionLogger),
       downloadTokenStore: asDownloadTokenStore(),
-      pushTokenStore: asPushTokenStore(),
+      pushNotifications: asPushNotifications(),
       paseoHome: "/tmp/paseo-test",
       agentManager: asAgentManager({
         subscribe: () => () => {},
@@ -1942,9 +1980,7 @@ test("close_items_request archives agents and kills terminals in one batch", asy
           remove: async () => {},
         };
       })(),
-      chatService: asChatService(),
       scheduleService: asScheduleService(),
-      loopService: asLoopService(),
       checkoutDiffManager: asCheckoutDiffManager({
         subscribe: async () => ({
           initial: { cwd: "/tmp", files: [], error: null },
@@ -2046,11 +2082,11 @@ test("close_items_request archives stored agents that are not currently loaded",
   const session = asTestSession(
     new Session({
       clientId: "test-client",
-      scopes: ["*"],
+      permissions: OWNER_PERMISSIONS,
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(sessionLogger),
       downloadTokenStore: asDownloadTokenStore(),
-      pushTokenStore: asPushTokenStore(),
+      pushNotifications: asPushNotifications(),
       paseoHome: "/tmp/paseo-test",
       agentManager: asAgentManager({
         subscribe: () => () => {},
@@ -2129,9 +2165,7 @@ test("close_items_request archives stored agents that are not currently loaded",
           remove: async () => {},
         };
       })(),
-      chatService: asChatService(),
       scheduleService: asScheduleService(),
-      loopService: asLoopService(),
       checkoutDiffManager: asCheckoutDiffManager({
         subscribe: async () => ({
           initial: { cwd: "/tmp", files: [], error: null },
@@ -2207,11 +2241,11 @@ test("close_items_request continues after an archive failure", async () => {
   const session = asTestSession(
     new Session({
       clientId: "test-client",
-      scopes: ["*"],
+      permissions: OWNER_PERMISSIONS,
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(sessionLogger),
       downloadTokenStore: asDownloadTokenStore(),
-      pushTokenStore: asPushTokenStore(),
+      pushNotifications: asPushNotifications(),
       paseoHome: "/tmp/paseo-test",
       agentManager: asAgentManager({
         subscribe: () => () => {},
@@ -2278,9 +2312,7 @@ test("close_items_request continues after an archive failure", async () => {
           remove: async () => {},
         };
       })(),
-      chatService: asChatService(),
       scheduleService: asScheduleService(),
-      loopService: asLoopService(),
       checkoutDiffManager: asCheckoutDiffManager({
         subscribe: async () => ({
           initial: { cwd: "/tmp", files: [], error: null },
@@ -3470,11 +3502,11 @@ test("workspace update stream keeps persisted workspace visible after agents sto
   const session = asTestSession(
     new Session({
       clientId: "test-client",
-      scopes: ["*"],
+      permissions: OWNER_PERMISSIONS,
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(logger),
       downloadTokenStore: asDownloadTokenStore(),
-      pushTokenStore: asPushTokenStore(),
+      pushNotifications: asPushNotifications(),
       paseoHome: "/tmp/paseo-test",
       agentManager: asAgentManager({
         subscribe: () => () => {},
@@ -3524,9 +3556,7 @@ test("workspace update stream keeps persisted workspace visible after agents sto
         archive: async () => {},
         remove: async () => {},
       },
-      chatService: asChatService(),
       scheduleService: asScheduleService(),
-      loopService: asLoopService(),
       checkoutDiffManager: asCheckoutDiffManager({
         subscribe: async () => ({
           initial: { cwd: "/tmp", files: [], error: null },
@@ -7774,15 +7804,17 @@ const ICON_PNG_1X1 = Buffer.from([
 
 test("project.icon.set.request publishes a custom icon that project.icon.get serves back", async () => {
   const emitted: SessionOutboundMessage[] = [];
+  const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "session-project-icon-test-")));
   const session = asTestSession(
-    createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) }),
+    createSessionForWorkspaceTests({
+      paseoHome: path.join(tempDir, "paseo-home"),
+      onMessage: (message) => emitted.push(message),
+    }),
   );
   session.updateClientCapabilities({ [CLIENT_CAPS.projectUpdates]: true });
 
-  const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "session-project-icon-test-")));
   const projectRoot = path.join(tempDir, "project-without-icons");
   mkdirSync(projectRoot, { recursive: true });
-  session.paseoHome = path.join(tempDir, "paseo-home");
 
   const project = createPersistedProjectRecord({
     projectId: "prj_icon",

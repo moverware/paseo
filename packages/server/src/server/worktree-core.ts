@@ -3,7 +3,6 @@ import { createNameId } from "mnemonic-id";
 import type { ForgeService } from "../services/forge-service.js";
 import {
   createWorktree,
-  resolveExistingWorktreeForSlug,
   slugify,
   validateBranchSlug,
   type WorktreeConfig,
@@ -63,9 +62,7 @@ async function createWorktreeCoreWithPriority(
   const requestedWorktreeSlug = input.worktreeSlug
     ? normalizeWorktreeSlug(input.worktreeSlug)
     : undefined;
-  const requestedBranchName = input.branchName
-    ? validateWorktreeSlug(input.branchName.trim())
-    : undefined;
+  const requestedBranchName = input.branchName?.trim();
 
   let intentInput: ResolveWorktreeCreationIntentInput;
   if (input.action === "checkout") {
@@ -116,16 +113,6 @@ async function createWorktreeCoreWithPriority(
         requestedWorktreeSlug ?? normalizeWorktreeSlug(intent.localBranchName ?? intent.headRef);
       break;
     }
-  }
-
-  const existingWorktree = await resolveExistingWorktreeForSlug({
-    slug: normalizedSlug,
-    repoRoot,
-    paseoHome: input.paseoHome,
-    worktreesRoot: input.worktreesRoot,
-  });
-  if (existingWorktree) {
-    return { worktree: existingWorktree, intent, repoRoot, created: false };
   }
 
   return {

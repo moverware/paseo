@@ -14,29 +14,10 @@
 
 import { nodeFileTrace } from "@vercel/nft";
 import { glob } from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
-
-function toTracePath(absolutePath) {
-  return path.relative(REPO_ROOT, absolutePath).split(path.sep).join("/");
-}
-
-function parcelWatcherNativePackagePath() {
-  const requireFromRepo = createRequire(path.join(REPO_ROOT, "package.json"));
-  requireFromRepo("@parcel/watcher");
-
-  const nativeAddonPath = Object.keys(requireFromRepo.cache)
-    .map(toTracePath)
-    .find((file) => /^node_modules\/@parcel\/watcher-[^/]+\/watcher\.node$/.test(file));
-  if (!nativeAddonPath) {
-    throw new Error("@parcel/watcher loaded without a platform native addon");
-  }
-
-  return path.posix.dirname(nativeAddonPath);
-}
 
 const { sherpaPlatformPackageName } = await import(
   pathToFileURL(
@@ -70,10 +51,14 @@ const entries = [
 // Files read at runtime via fs APIs rather than `require`. nft only
 // traces the module graph; data files have to be listed explicitly.
 const additionalInputs = [
+  // Agent orchestration skill catalog loaded through filesystem paths
+  "packages/server/dist/server/skills/**",
   // Shell integration scripts loaded by the terminal manager
   "packages/server/dist/server/terminal/shell-integration/**",
   // Silero VAD ONNX model (sherpa speech provider)
   "packages/server/dist/server/server/speech/providers/local/sherpa/assets/silero_vad.onnx",
+  // OpenCode loads this plugin from a content-addressed runtime copy.
+  "packages/server/dist/server/server/agent/providers/opencode/bridge-plugin.bundle.mjs",
   // Server runtime config files (read by path, not require)
   "packages/server/.env.example",
   // CLI shebang script wrapping dist/index.js
@@ -84,10 +69,6 @@ const additionalInputs = [
   // the Nix derivation builds for one platform at a time and ships only
   // its own binaries.
   `node_modules/node-pty/prebuilds/${process.platform}-${process.arch}/**`,
-  // @parcel/watcher dynamically resolves its optional platform package. npm's
-  // build closure can contain multiple libc variants, so copy the package the
-  // wrapper actually loaded rather than every installed optional package.
-  `${parcelWatcherNativePackagePath()}/**`,
   // sherpa-onnx-node dynamically resolves a platform-specific native package.
   // Copy the wrapper plus the host platform package explicitly.
   "node_modules/sherpa-onnx-node/**",

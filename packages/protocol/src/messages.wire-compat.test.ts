@@ -4,6 +4,7 @@ import {
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
+  SessionOutboundMessageSchema,
   WSHelloMessageSchema,
 } from "./messages.js";
 
@@ -75,6 +76,28 @@ describe("wire schema compatibility", () => {
     ]);
   });
 
+  test("timeline replacement invalidation is opt-in and carries no timeline rows", () => {
+    expect(
+      WSHelloMessageSchema.parse({
+        type: "hello",
+        clientId: "capable-client",
+        clientType: "mobile",
+        protocolVersion: 1,
+        capabilities: { timeline_replacement_invalidation: true },
+      }).capabilities,
+    ).toEqual({ timeline_replacement_invalidation: true });
+
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "agent.timeline.replacement",
+        payload: { agentId: "agent-1", epoch: "epoch-2" },
+      }),
+    ).toEqual({
+      type: "agent.timeline.replacement",
+      payload: { agentId: "agent-1", epoch: "epoch-2" },
+    });
+  });
+
   test("server info strips unknown legacy features while accepting former turn identity", () => {
     const parsed = ServerInfoStatusPayloadSchema.parse({
       status: "server_info",
@@ -114,6 +137,40 @@ describe("wire schema compatibility", () => {
       type: "assistant_message",
       text: "new daemon shape",
       messageId: "msg-1",
+    });
+  });
+
+  test("task progress fields are optional on the wire", () => {
+    expect(
+      AgentTimelineItemPayloadSchema.parse({
+        type: "todo",
+        items: [{ text: "Legacy task", completed: false }],
+      }),
+    ).toEqual({ type: "todo", items: [{ text: "Legacy task", completed: false }] });
+    expect(
+      AgentTimelineItemPayloadSchema.parse({
+        type: "todo",
+        items: [
+          {
+            id: "task-1",
+            text: "Current task",
+            activeForm: "Working on current task",
+            status: "in_progress",
+            completed: false,
+          },
+        ],
+      }),
+    ).toEqual({
+      type: "todo",
+      items: [
+        {
+          id: "task-1",
+          text: "Current task",
+          activeForm: "Working on current task",
+          status: "in_progress",
+          completed: false,
+        },
+      ],
     });
   });
 

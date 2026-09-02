@@ -2,7 +2,8 @@ import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, it } from "vitest";
-import { HubHttpClient } from "./client.js";
+import { HubHttpClient } from "./hub-client/index.js";
+import { HubCommandError } from "./error.js";
 
 const servers: Array<ReturnType<typeof createServer>> = [];
 
@@ -89,11 +90,161 @@ describe("Hub HTTP client", () => {
       ["/api/v1/projects", "/api/v1/daemons/enrollment-tokens"],
     );
   });
+
+  it("reads self-contained trigger documents for export", async () => {
+    const requests: Array<{ url: string | undefined; body: string }> = [];
+    const origin = await startServer(
+      () => ({
+        status: 200,
+        body: {
+          triggers: [
+            {
+              id: "a50e05af-4f20-4c8f-8dcc-58e5ea360663",
+              name: "slack-help",
+              enabled: true,
+              format: "single_run",
+              yaml: "name: slack-help\n",
+            },
+          ],
+        },
+      }),
+      requests,
+    );
+
+    const triggers = await new HubHttpClient().listTriggers(origin, "secret");
+
+    assert.equal(triggers[0]?.yaml, "name: slack-help\n");
+    assert.deepEqual(requests[0], { url: "/api/v1/triggers", body: "" });
+  });
+
+  it("reads configuration resources in the Hub's slug vocabulary", async () => {
+    const requests: Array<{ url: string | undefined; body: string }> = [];
+    const origin = await startServer(
+      () => ({
+        status: 200,
+        body: {
+          daemons: [{ id: "a50e05af-4f20-4c8f-8dcc-58e5ea360663", slug: "macbook" }],
+          github: [
+            {
+              slug: "getpaseo",
+              accountLogin: "getpaseo",
+              accountType: "Organization",
+              repositories: ["getpaseo/paseo"],
+            },
+          ],
+          discord: [{ slug: "paseo", guildName: "Paseo" }],
+          slack: [{ slug: "paseo", teamName: "Paseo" }],
+        },
+      }),
+      requests,
+    );
+
+    const resources = await new HubHttpClient().listConfigurationResources(origin, "secret");
+
+    assert.equal(resources.daemons[0]?.slug, "macbook");
+    assert.equal(resources.discord[0]?.slug, "paseo");
+    assert.equal(requests[0]?.url, "/api/v1/configuration-resources");
+  });
+
+  it("reads strict provider-native setup resources", async () => {
+    const requests: Array<{ url: string | undefined; body: string }> = [];
+    const origin = await startServer(
+      () => ({
+        status: 200,
+        body: {
+          github: [
+            {
+              slug: "getpaseo",
+              accountLogin: "getpaseo",
+              accountType: "Organization",
+              repositories: ["getpaseo/paseo"],
+            },
+          ],
+          discord: [{ guildId: "guild-123", guildName: "Paseo" }],
+          slack: [{ teamId: "team-123", teamName: "Paseo" }],
+        },
+      }),
+      requests,
+    );
+
+    const resources = await new HubHttpClient().listSetupResources(origin, "secret");
+
+    assert.equal(resources.slack[0]?.teamId, "team-123");
+    assert.equal(resources.discord[0]?.guildId, "guild-123");
+    assert.deepEqual(requests[0], { url: "/api/v1/setup-resources", body: "" });
+  });
+
+  it.each([
+    { github: [], discord: [], slack: [{ teamId: "team-123", teamName: "Paseo", slug: "wrong" }] },
+    { github: [], discord: [], slack: [{ teamId: 123, teamName: "Paseo" }] },
+  ])("rejects malformed or unknown setup resource fields", async (body) => {
+    const requests: Array<{ url: string | undefined; body: string }> = [];
+    const origin = await startServer(
+      () => ({
+        status: 200,
+        body,
+      }),
+      requests,
+    );
+
+    await assert.rejects(new HubHttpClient().listSetupResources(origin, "secret"), {
+      code: "HUB_INVALID_RESPONSE",
+    });
+  });
+
+  it("renders file-aware Hub validation issues without exposing credentials or response bodies", async () => {
+    const requests: Array<{ url: string | undefined; body: string }> = [];
+    const origin = await startServer(
+      () => ({
+        status: 422,
+        contentType: "application/problem+json",
+        body: {
+          type: "https://hub.test/problems/invalid-configuration-bundle",
+          title: "Invalid configuration bundle",
+          status: 422,
+          detail: "Correct the canonical Hub bundle files. operator-secret",
+          code: "invalid_configuration_bundle",
+          requestId: "request-1",
+          issues: [
+            {
+              path: [".paseo/workflows/answer.yml", "steps", "work", "agent"],
+              message: "unknown named agent operator-secret",
+            },
+          ],
+        },
+      }),
+      requests,
+    );
+    const hub = new HubHttpClient();
+
+    await assert.rejects(
+      hub.validateConfiguration({
+        origin,
+        apiKey: "operator-secret",
+        projectSlug: "studio",
+        files: [{ path: ".paseo/hub.yml", content: "sensitive bundle content" }],
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof HubCommandError);
+        assert.equal(error.message.includes("operator-secret"), false);
+        assert.equal(error.message.includes("Correct the canonical"), false);
+        assert.equal(error.details?.includes("operator-secret"), false);
+        assert.equal(error.message.includes("sensitive bundle content"), false);
+        assert.equal(error.details?.includes("sensitive bundle content"), false);
+        assert.equal(
+          error.details,
+          ".paseo/workflows/answer.yml: steps.work.agent: unknown named agent [redacted]",
+        );
+        return true;
+      },
+    );
+  });
 });
 
 interface TestResponse {
   status: number;
   body: unknown;
+  contentType?: string;
 }
 
 async function startServer(
@@ -109,7 +260,9 @@ async function startServer(
     request.on("end", () => {
       requests.push({ url: request.url, body });
       const configured = responseFor(request.url);
-      response.writeHead(configured.status, { "content-type": "application/json" });
+      response.writeHead(configured.status, {
+        "content-type": configured.contentType ?? "application/json",
+      });
       response.end(JSON.stringify(configured.body));
     });
   });

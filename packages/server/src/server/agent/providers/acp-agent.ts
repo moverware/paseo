@@ -85,6 +85,7 @@ import {
   type AgentTimelineItem,
   type AgentUsage,
   type FetchCatalogOptions,
+  type ProviderRefreshContext,
   type ImportableProviderSession,
   type ImportProviderSessionContext,
   type ImportProviderSessionInput,
@@ -96,6 +97,10 @@ import {
   type ToolCallDetail,
   type ToolCallTimelineItem,
 } from "../agent-sdk-types.js";
+import {
+  raceProviderRefreshAbort,
+  runProviderRefreshActivity,
+} from "../provider-refresh-deadline.js";
 import {
   isDefaultAgentCreateConfigUnattended,
   resolveDefaultAgentCreateConfig,
@@ -225,9 +230,6 @@ function pushACPStderrRow(rows: DiagnosticEntry[], stderrChunks: string[]): void
 export const DEFAULT_ACP_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
-  // ACP agents can list prior sessions via `session/list`. The runtime probe in
-  // listImportableSessions returns nothing for agents that don't advertise the
-  // capability, so enabling this here only makes the daemon query them.
   supportsSessionListing: true,
   supportsDynamicModes: true,
   supportsMcpServers: true,
@@ -238,12 +240,19 @@ export const DEFAULT_ACP_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindBoth: false,
 };
 
+function acpSessionListRequest(cursor: string | null | undefined, cwd: string | undefined) {
+  return {
+    ...(cursor ? { cursor } : {}),
+    ...(cwd ? { cwd } : {}),
+  };
+}
+
 const BASE_ACP_CLIENT_CAPABILITIES: ACPClientCapabilities = {
   fs: {
     readTextFile: false,
     writeTextFile: false,
   },
-  terminal: false,
+  terminal: true,
 };
 
 export type ACPClientCapabilityMeta = Record<string, unknown>;
@@ -267,7 +276,6 @@ export function buildACPClientCapabilities(
 // sign-in URL in the browser) when probing an ACP agent for models/modes.
 // NO_BROWSER is honored by Gemini CLI; other ACP agents ignore it.
 const PROBE_ENV: Record<string, string> = { NO_BROWSER: "true" };
-const ACP_CATALOG_TIMEOUT_MS = 60_000;
 const ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS = 20_000;
 
 function summarizeMalformedACPStdoutError(error: unknown): { type: string; message: string } {
@@ -934,66 +942,83 @@ export class ACPAgentClient implements AgentClient {
     return session;
   }
 
-  async fetchCatalog(options: FetchCatalogOptions): Promise<ProviderCatalog> {
+  async fetchCatalog(
+    options: FetchCatalogOptions,
+    context?: ProviderRefreshContext,
+  ): Promise<ProviderCatalog> {
     const cwd = options.scope === "global" ? homedir() : options.cwd;
-    const timeoutMs = options.timeoutMs ?? ACP_CATALOG_TIMEOUT_MS;
     let probe: UninitializedACPProcess | null = null;
-    try {
-      const catalogProbe = (async () => {
-        const initializedProbe = await this.spawnProcess(PROBE_ENV, {
-          initializeTimeoutMs: timeoutMs,
-          onSpawned: (spawned) => {
-            probe = spawned;
-          },
-        });
-        probe = initializedProbe;
-        const response = await this.runACPRequest(() =>
-          initializedProbe.connection.newSession({
-            cwd,
-            mcpServers: [],
-          }),
-        );
-        const transformed = this.transformSessionResponse(response);
-        const derivedModels = deriveModelDefinitionsFromACP(
-          this.provider,
-          transformed.models,
-          transformed.configOptions,
-        );
-        const models = this.catalogModelResolver
-          ? await this.catalogModelResolver({
-              connection: initializedProbe.connection,
-              sessionId: response.sessionId,
-              models: derivedModels,
-              configOptions: transformed.configOptions,
-              runRequest: (request) => this.runACPRequest(request),
-              transformConfigOptions: (configOptions) =>
-                this.configOptionsTransformer
-                  ? this.configOptionsTransformer(configOptions)
-                  : configOptions,
-              logger: this.logger,
-              provider: this.provider,
-            })
-          : derivedModels;
-        const modeInfo = deriveModesFromACP(
-          this.defaultModes,
-          transformed.modes,
-          transformed.configOptions,
-        );
-        return {
-          models: this.modelTransformer ? this.modelTransformer(models) : models,
-          modes: modeInfo.modes,
-        };
-      })();
+    let closePromise: Promise<void> | null = null;
+    const closeProbe = (): Promise<void> => {
+      if (!probe) return Promise.resolve();
+      closePromise ??= this.closeProbe(probe);
+      return closePromise;
+    };
+    const handleAbort = () => void closeProbe().catch(() => undefined);
+    context?.signal.addEventListener("abort", handleAbort, { once: true });
 
-      return await withTimeout(
-        catalogProbe,
-        timeoutMs,
-        `ACP catalog probe timed out after ${timeoutMs}ms`,
+    try {
+      const initializedProbe = await runProviderRefreshActivity(context, "initialize", () =>
+        raceProviderRefreshAbort(
+          context?.signal,
+          this.spawnProcess(PROBE_ENV, {
+            onSpawned: (spawned) => {
+              probe = spawned;
+              if (context?.signal.aborted) void closeProbe().catch(() => undefined);
+            },
+          }),
+        ),
       );
+      probe = initializedProbe;
+      const response = await runProviderRefreshActivity(context, "session/new", () =>
+        raceProviderRefreshAbort(
+          context?.signal,
+          this.runACPRequest(() =>
+            initializedProbe.connection.newSession({
+              cwd,
+              mcpServers: [],
+            }),
+          ),
+        ),
+      );
+      const transformed = this.transformSessionResponse(response);
+      const derivedModels = deriveModelDefinitionsFromACP(
+        this.provider,
+        transformed.models,
+        transformed.configOptions,
+      );
+      const models = this.catalogModelResolver
+        ? await runProviderRefreshActivity(context, "catalog.resolve", () =>
+            raceProviderRefreshAbort(
+              context?.signal,
+              this.catalogModelResolver?.({
+                connection: initializedProbe.connection,
+                sessionId: response.sessionId,
+                models: derivedModels,
+                configOptions: transformed.configOptions,
+                runRequest: (request) => this.runACPRequest(request),
+                transformConfigOptions: (configOptions) =>
+                  this.configOptionsTransformer
+                    ? this.configOptionsTransformer(configOptions)
+                    : configOptions,
+                logger: this.logger,
+                provider: this.provider,
+              }) ?? Promise.resolve(derivedModels),
+            ),
+          )
+        : derivedModels;
+      const modeInfo = deriveModesFromACP(
+        this.defaultModes,
+        transformed.modes,
+        transformed.configOptions,
+      );
+      return {
+        models: this.modelTransformer ? this.modelTransformer(models) : models,
+        modes: modeInfo.modes,
+      };
     } finally {
-      if (probe) {
-        await this.closeProbe(probe);
-      }
+      context?.signal.removeEventListener("abort", handleAbort);
+      await closeProbe();
     }
   }
 
@@ -1035,13 +1060,7 @@ export class ACPAgentClient implements AgentClient {
       let cursor: string | null | undefined;
       for (;;) {
         const page: ListSessionsResponse = await this.runACPRequest(() =>
-          probe.connection.listSessions({
-            ...(cursor ? { cursor } : {}),
-            // Filter by working directory at the source. Without this the agent
-            // returns globally-recent sessions, which the `limit` below can
-            // truncate before the current directory's sessions are reached.
-            ...(options?.cwd ? { cwd: options.cwd } : {}),
-          }),
+          probe.connection.listSessions(acpSessionListRequest(cursor, options?.cwd)),
         );
         for (const session of page.sessions) {
           sessions.push({

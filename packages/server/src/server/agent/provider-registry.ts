@@ -13,6 +13,7 @@ import type {
   AgentSession,
   AgentStreamEvent,
   FetchCatalogOptions,
+  ProviderRefreshContext,
   ProviderCatalog,
   ResolveAgentCreateConfigInput,
   ResolveAgentCreateConfigResult,
@@ -24,6 +25,7 @@ import {
   resolveDefaultAgentCreateConfig,
 } from "./create-agent-mode.js";
 import { normalizeAgentModelDefinition } from "./agent-sdk-types.js";
+import { runProviderRefreshActivity } from "./provider-refresh-deadline.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { ManagedProcessRegistry } from "../managed-processes/managed-processes.js";
 import type {
@@ -40,6 +42,7 @@ import { GenericACPAgentClient } from "./providers/generic-acp-agent.js";
 import { KimiACPAgentClient } from "./providers/kimi-acp-agent.js";
 import { KiroACPAgentClient } from "./providers/kiro-acp-agent.js";
 import { OpenCodeAgentClient } from "./providers/opencode-agent.js";
+import type { OpenCodeBridge } from "./providers/opencode/bridge.js";
 import { OmpAgentClient } from "./providers/omp/agent.js";
 import type { OmpRuntime } from "./providers/omp/runtime.js";
 import { PiRpcAgentClient } from "./providers/pi/agent.js";
@@ -92,7 +95,11 @@ export interface ProviderDefinition extends AgentProviderDefinition {
    * Single catalog discovery call used by ProviderSnapshotManager. Should spawn
    * at most one provider runtime process and return both models and modes.
    */
-  fetchCatalog: (options: FetchCatalogOptions, client?: AgentClient) => Promise<ProviderCatalog>;
+  fetchCatalog: (
+    options: FetchCatalogOptions,
+    client?: AgentClient,
+    context?: ProviderRefreshContext,
+  ) => Promise<ProviderCatalog>;
 }
 
 export interface BuildProviderRegistryOptions {
@@ -102,12 +109,14 @@ export interface BuildProviderRegistryOptions {
   managedProcesses?: ManagedProcessRegistry;
   isDev?: boolean;
   ompRuntime?: OmpRuntime;
+  openCodeBridge?: OpenCodeBridge;
 }
 
 interface ProviderClientFactoryOptions extends Pick<
   BuildProviderRegistryOptions,
   "workspaceGitService" | "managedProcesses" | "ompRuntime"
 > {
+  openCodeBridge?: OpenCodeBridge;
   providerParams?: unknown;
   customProvider?: {
     id: string;
@@ -206,6 +215,7 @@ const PROVIDER_CLIENT_FACTORIES: Record<string, ProviderClientFactory> = {
   opencode: (logger, runtimeSettings, options) =>
     new OpenCodeAgentClient(logger, runtimeSettings, {
       managedProcesses: options?.managedProcesses,
+      bridge: options?.openCodeBridge,
     }),
   pi: (logger, runtimeSettings, options) =>
     new PiRpcAgentClient({
@@ -520,8 +530,8 @@ function wrapClientProvider(
           options,
         ),
       ),
-    fetchCatalog: async (options) => {
-      const catalog = await inner.fetchCatalog(options);
+    fetchCatalog: async (options, context) => {
+      const catalog = await inner.fetchCatalog(options, context);
       return {
         ...catalog,
         models: mergeModels(provider, profileModels, additionalModels, catalog.models, {
@@ -531,10 +541,11 @@ function wrapClientProvider(
       };
     },
     resolveDefaultModeId: inner.resolveDefaultModeId
-      ? async ({ config, env }: ResolveAgentDefaultModeInput) =>
+      ? async ({ config, env, signal }: ResolveAgentDefaultModeInput) =>
           await inner.resolveDefaultModeId?.({
             config: { ...config, provider: inner.provider },
             env,
+            signal,
           })
       : undefined,
     resolveCreateConfig: inner.resolveCreateConfig?.bind(inner),
@@ -574,7 +585,7 @@ function wrapClientProvider(
           };
         }
       : undefined,
-    isAvailable: () => inner.isAvailable(),
+    isAvailable: (signal) => inner.isAvailable(signal),
     getDiagnostic: inner.getDiagnostic?.bind(inner),
   };
 }
@@ -634,7 +645,11 @@ function createRegistryEntry(
     resolveCreateConfig: modelClient.resolveCreateConfig ?? resolveDefaultAgentCreateConfig,
     isCreateConfigUnattended:
       modelClient.isCreateConfigUnattended ?? isDefaultAgentCreateConfigUnattended,
-    fetchCatalog: async (options: FetchCatalogOptions, client?: AgentClient) => {
+    fetchCatalog: async (
+      options: FetchCatalogOptions,
+      client?: AgentClient,
+      context?: ProviderRefreshContext,
+    ) => {
       const catalogClient = client ?? modelClient;
       if (hasReplacementModels) {
         // Replacement models skip runtime model discovery, but additionalModels
@@ -642,23 +657,29 @@ function createRegistryEntry(
         // the single catalog API; otherwise use static/empty modes with no runtime.
         const models = mergeModelAdditions(provider, replacementModels, additionalModels);
         if (hasStaticModes) {
-          const defaultModeId = await catalogClient.resolveDefaultModeId?.({
-            config: {
-              provider,
-              cwd: options.scope === "workspace" ? options.cwd : process.cwd(),
-            },
-          });
+          const defaultModeId = await runProviderRefreshActivity(
+            context,
+            "default-mode",
+            async () =>
+              await catalogClient.resolveDefaultModeId?.({
+                config: {
+                  provider,
+                  cwd: options.scope === "workspace" ? options.cwd : process.cwd(),
+                },
+                signal: context?.signal,
+              }),
+          );
           return {
             models,
             modes: decorateModes(resolved.definition.modes),
             defaultModeId,
           };
         }
-        const catalog = await catalogClient.fetchCatalog(options);
+        const catalog = await catalogClient.fetchCatalog(options, context);
         return { ...catalog, models, modes: decorateModes(catalog.modes) };
       }
 
-      const catalog = await catalogClient.fetchCatalog(options);
+      const catalog = await catalogClient.fetchCatalog(options, context);
       return {
         ...catalog,
         models: mergeModels(provider, profileModels, additionalModels, catalog.models, {
@@ -696,7 +717,7 @@ function buildResolvedBuiltinProviders(
   runtimeSettings: AgentProviderRuntimeSettingsMap | undefined,
   options: Pick<
     BuildProviderRegistryOptions,
-    "workspaceGitService" | "managedProcesses" | "ompRuntime"
+    "workspaceGitService" | "managedProcesses" | "ompRuntime" | "openCodeBridge"
   >,
   isDev: boolean,
 ): Map<string, ResolvedProvider> {
@@ -728,6 +749,7 @@ function buildResolvedBuiltinProviders(
           workspaceGitService: options.workspaceGitService,
           managedProcesses: options.managedProcesses,
           ompRuntime: options.ompRuntime,
+          openCodeBridge: options.openCodeBridge,
           providerParams: override?.params,
         }),
       contract: PROVIDER_CONTRACTS[definition.id] ?? UNSUPPORTED_PROVIDER_CONTRACT,
@@ -740,7 +762,7 @@ function buildResolvedBuiltinProviders(
 function addDerivedProviders(
   resolvedProviders: Map<string, ResolvedProvider>,
   providerOverrides: Record<string, ProviderOverride>,
-  options: Pick<BuildProviderRegistryOptions, "managedProcesses">,
+  options: Pick<BuildProviderRegistryOptions, "managedProcesses" | "openCodeBridge">,
 ): void {
   for (const [providerId, override] of Object.entries(providerOverrides)) {
     if (resolvedProviders.has(providerId) || BUILTIN_PROVIDER_IDS.includes(providerId)) {
@@ -836,6 +858,7 @@ function addDerivedProviders(
       createBaseClient: (logger) =>
         baseFactory(logger, mergedRuntimeSettings, {
           managedProcesses: options.managedProcesses,
+          openCodeBridge: options.openCodeBridge,
           providerParams,
           customProvider: {
             id: providerId,
@@ -861,11 +884,13 @@ export function buildProviderRegistry(
       workspaceGitService: options?.workspaceGitService,
       managedProcesses: options?.managedProcesses,
       ompRuntime: options?.ompRuntime,
+      openCodeBridge: options?.openCodeBridge,
     },
     options?.isDev === true,
   );
   addDerivedProviders(resolvedProviders, providerOverrides, {
     managedProcesses: options?.managedProcesses,
+    openCodeBridge: options?.openCodeBridge,
   });
 
   return Object.fromEntries(

@@ -66,6 +66,34 @@ const PreviousHubAgentCreateWithAutoArchiveRequestSchema =
   });
 
 describe("Hub session protocol", () => {
+  test("round-trips named-agent validation", () => {
+    const request = {
+      type: "hub.execution.agent.validate.request" as const,
+      requestId: "validate-codex",
+      provider: "codex",
+      model: "gpt-5.5",
+      thinkingOptionId: "xhigh",
+      providerOptions: {
+        sandbox_workspace_write: {
+          writable_roots: ["/var/cache/npm"],
+          network_access: false,
+        },
+      },
+    };
+    const response = {
+      type: "hub.execution.agent.validate.response" as const,
+      payload: {
+        requestId: request.requestId,
+        valid: true,
+        issues: [],
+        error: null,
+      },
+    };
+
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+    expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+  });
+
   test("accepts the Hub execution create request", () => {
     const message = {
       type: "hub.execution.agent.create.request",
@@ -307,9 +335,16 @@ describe("Hub session protocol", () => {
       requestId: "r1",
       hubUrl: "https://hub.example",
       token: "token",
+      permissions: [],
     },
     { type: "hub.management.daemon.get_status.request", requestId: "r2" },
     { type: "hub.management.daemon.disconnect.request", requestId: "r3", force: true },
+    {
+      type: "hub.management.daemon.permissions.update.request",
+      requestId: "r4",
+      grant: ["hub.execute"],
+      revoke: [],
+    },
   ])("accepts trusted management request $type", (message) => {
     expect(SessionInboundMessageSchema.parse(message)).toEqual(message);
   });
@@ -323,7 +358,7 @@ describe("Hub session protocol", () => {
           state: "connected",
           daemonId: "daemon-1",
           hubOrigin: "https://hub.example",
-          scopes: ["hub.execution.*"],
+          permissions: ["hub.execute"],
           connectedAt: "2026-07-13T00:00:00.000Z",
           lastError: null,
         },
@@ -337,7 +372,7 @@ describe("Hub session protocol", () => {
           state: "not_connected",
           daemonId: null,
           hubOrigin: null,
-          scopes: [],
+          permissions: [],
           connectedAt: null,
           lastError: null,
         },
@@ -351,11 +386,25 @@ describe("Hub session protocol", () => {
           state: "disconnecting",
           daemonId: "daemon-1",
           hubOrigin: "https://hub.example",
-          scopes: ["hub.execution.*"],
+          permissions: ["hub.execute"],
           connectedAt: null,
           lastError: "offline",
         },
         warning: "pending",
+      },
+    },
+    {
+      type: "hub.management.daemon.permissions.update.response",
+      payload: {
+        requestId: "r4",
+        status: {
+          state: "connected",
+          daemonId: "daemon-1",
+          hubOrigin: "https://hub.example",
+          permissions: ["hub.execute"],
+          connectedAt: "2026-07-13T00:00:00.000Z",
+          lastError: null,
+        },
       },
     },
   ])("accepts trusted management response $type", (message) => {

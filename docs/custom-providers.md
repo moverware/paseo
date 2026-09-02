@@ -2,7 +2,7 @@
 
 Paseo supports configuring custom agent providers through `config.json` (located at `$PASEO_HOME/config.json`, typically `~/.paseo/config.json`). You can extend built-in providers with different API backends, add ACP-compatible agents, set custom binaries, disable providers, and create multiple profiles for the same underlying provider.
 
-All provider configuration lives under `agents.providers` in config.json:
+Provider definitions live under `agents.providers` in config.json:
 
 ```json
 {
@@ -16,6 +16,20 @@ All provider configuration lives under `agents.providers` in config.json:
 ```
 
 Provider IDs must be lowercase alphanumeric with hyphens (`/^[a-z][a-z0-9-]*$/`).
+
+Each provider catalog refresh waits up to 2 minutes. If a provider loads many plugins or a large
+agent catalog during startup, raise the limit in milliseconds:
+
+```json
+{
+  "agents": {
+    "catalogRefreshTimeoutMs": 180000
+  }
+}
+```
+
+The limit applies independently to every provider refresh and covers availability plus the entire
+catalog probe. `PASEO_PROVIDER_REFRESH_TIMEOUT_MS` sets it when the config field is absent.
 
 ---
 
@@ -245,6 +259,8 @@ requires_openai_auth = false
 
 You can create multiple entries that extend the same built-in provider. Each gets its own entry in the provider list with independent credentials, models, and environment.
 
+"Profile" here means a provider alias, and it is not an **Agent profile** — that is a named bundle of provider, model, mode, thinking option and features, stored under `daemon.agentProfiles`. See [glossary.md](glossary.md) for all four senses of the word.
+
 Example: two different Anthropic accounts as separate profiles:
 
 ```json
@@ -377,6 +393,7 @@ Custom OMP profiles should extend `omp`. They inherit the OMP adapter's `rpc-ui`
         },
         "params": {
           "sessionDir": "~/.local/state/omp-work/omp/agent/sessions",
+          "rpcTimeoutMs": 60000,
           "smolModel": "openai/gpt-5-mini",
           "slowModel": "anthropic/claude-opus-4-1",
           "planModel": "openai/o3"
@@ -387,7 +404,7 @@ Custom OMP profiles should extend `omp`. They inherit the OMP adapter's `rpc-ui`
 }
 ```
 
-`params.sessionDir` is used only for importing sessions that were started outside Paseo. If `command` or XDG env vars move OMP's state directory, set `params.sessionDir` to the resulting OMP JSONL session directory; launching and resuming still go through the configured command.
+`params.sessionDir` is used only for importing sessions that were started outside Paseo. If `command` or XDG env vars move OMP's state directory, set `params.sessionDir` to the resulting OMP JSONL session directory; launching and resuming still go through the configured command. OMP waits 20 seconds for its initial `ready` frame and 60 seconds for later control-plane RPCs by default. `params.rpcTimeoutMs` overrides both deadlines.
 
 For other providers that keep Pi's `--mode rpc` API but write sessions somewhere else, extend `pi`, replace the command, and provide the JSONL session directory:
 
@@ -400,7 +417,8 @@ For other providers that keep Pi's `--mode rpc` API but write sessions somewhere
         "label": "My Pi Fork",
         "command": ["my-pi-fork"],
         "params": {
-          "sessionDir": "~/.my-pi-fork/sessions"
+          "sessionDir": "~/.my-pi-fork/sessions",
+          "rpcTimeoutMs": 60000
         }
       }
     }
@@ -408,7 +426,7 @@ For other providers that keep Pi's `--mode rpc` API but write sessions somewhere
 }
 ```
 
-This session directory is also import-only. Launching and resuming still go through the configured command, so this example resumes with `my-pi-fork --mode rpc --session <session-file>`.
+This session directory is also import-only. Launching and resuming still go through the configured command, so this example resumes with `my-pi-fork --mode rpc --session <session-file>`. `params.rpcTimeoutMs` overrides the 60-second Pi control-plane RPC deadline.
 
 ---
 
@@ -485,25 +503,25 @@ Paseo tools such as subagent creation come from the shared internal tool catalog
 }
 ```
 
-ACP agents execute filesystem and terminal operations in their own environment
-by default. To let a compliant agent delegate those operations to Paseo instead,
-enable the corresponding client capabilities:
+ACP agents execute filesystem operations in their own environment by default,
+while terminal operations run through Paseo on the host. To customize which
+operations Paseo handles, configure client capabilities in provider params:
 
 ```json
 {
   "agents": {
     "providers": {
-      "local-agent": {
+      "container-agent": {
         "extends": "acp",
-        "label": "Local Agent",
-        "command": ["local-agent", "acp"],
+        "label": "Container Agent",
+        "command": ["container-agent", "acp"],
         "params": {
           "clientCapabilities": {
             "fs": {
-              "readTextFile": true,
-              "writeTextFile": true
+              "readTextFile": false,
+              "writeTextFile": false
             },
-            "terminal": true
+            "terminal": false
           }
         }
       }
@@ -512,9 +530,11 @@ enable the corresponding client capabilities:
 }
 ```
 
-Only enable capabilities Paseo should execute. When the agent and Paseo run in
-different environments, configure equivalent absolute workspace paths before
-delegating filesystem or terminal operations to Paseo.
+When an agent runs in a container or remote environment that manages its own
+terminal, set `terminal: false` to keep command execution inside the agent
+container. When delegating filesystem operations to Paseo (`fs.readTextFile: true`
+or `fs.writeTextFile: true`), ensure the agent and Paseo share equivalent
+absolute workspace paths.
 
 ### Generic ACP diagnostics
 

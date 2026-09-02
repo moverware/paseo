@@ -105,17 +105,41 @@ Everything you can do in the app, you can do from the terminal.
 
 ```bash
 paseo run --provider claude/opus-4.6 "implement user authentication"
-paseo run --provider codex/gpt-5.4 --worktree feature-x "implement feature X"
+paseo run --provider codex/gpt-5.5 --worktree feature-x "implement feature X"
 
 paseo ls                           # list running agents
 paseo attach abc123                # stream live output
 paseo send abc123 "also add tests" # follow-up task
 
-# run on a remote daemon
-paseo --host workstation.local:6767 run "run the full test suite"
+# run on a remote daemon; --cwd is a path on that host
+paseo run --host workstation.local:6767 --cwd /workspace "run the full test suite"
 ```
 
 See the [full CLI reference](https://paseo.sh/docs/cli) for more.
+
+## TypeScript SDK
+
+Build issue integrations, dashboards, and orchestration services with `@getpaseo/client`:
+
+```ts
+import { createPaseoClient } from "@getpaseo/client";
+
+const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
+await client.connect();
+
+const agent = await client.agents.create({
+  config: { provider: "codex/gpt-5.5" },
+  cwd: "/Users/me/dev/storefront",
+  prompt: "Review the current diff and name the riskiest change.",
+});
+
+const result = await agent.waitForFinish();
+console.log(result.lastMessage);
+
+await client.close();
+```
+
+See the [SDK quickstart](https://paseo.sh/docs/sdk/quickstart), [recipes](https://paseo.sh/docs/sdk/recipes), and [API reference](https://paseo.sh/docs/sdk/reference).
 
 ## Skills
 
@@ -128,7 +152,6 @@ npx skills add getpaseo/paseo
 Then use them in any agent conversation:
 
 - `/paseo-handoff` — hand off work between agents. I use this to plan with Claude and then handoff to Codex to implement.
-- `/paseo-loop` — loop an agent against clear acceptance criteria (aka Ralph loops), optionally with a verifier.
 - `/paseo-advisor` — spin up a single agent as an advisor for a second opinion, without delegating the work itself.
 - `/paseo-committee` — form a committee of two contrasting agents to step back, do root cause analysis, and produce a plan.
 
@@ -165,9 +188,8 @@ npm run typecheck
 ## Related projects
 
 - [getpaseo/paseo-relay](https://github.com/getpaseo/paseo-relay) — official distributed relay, written in Elixir
-- [paseo-skins](https://github.com/huangguang1999/paseo-skins) — community themes and a zero-patch desktop theme loader with an Agent Skill
 - [paseo-vscode](https://marketplace.visualstudio.com/items?itemName=hinnes.paseo-vscode) — VS Code extension
 
 ## License
 
-AGPL-3.0
+Apache-2.0

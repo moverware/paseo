@@ -11,7 +11,6 @@ import {
   type WorkspaceDescriptor,
 } from "./session-store";
 import type { StreamItem } from "../types/stream";
-import { patchWorkspaceScripts } from "../contexts/session-workspace-scripts";
 
 function createWorkspace(
   input: Partial<WorkspaceDescriptor> & Pick<WorkspaceDescriptor, "id">,
@@ -79,6 +78,62 @@ function permutations<T>(values: readonly T[]): T[][] {
     ),
   );
 }
+
+function taskTexts(tasks: ReadonlyArray<{ text: string }>): string[] {
+  return tasks.map((task) => task.text);
+}
+
+describe("agent task state", () => {
+  it("notifies the task subscriber only when its task snapshot changes", () => {
+    initializeTestSession();
+    const snapshots: string[][] = [];
+    const unsubscribe = useSessionStore.subscribe(
+      (state) => state.sessions["test-server"]?.agentTasks.get("agent-1") ?? [],
+      (tasks) => snapshots.push(taskTexts(tasks)),
+    );
+
+    const tasks = [{ id: "1", text: "Inspect", status: "pending" as const, completed: false }];
+    useSessionStore
+      .getState()
+      .setAgentStreamState("test-server", "agent-1", { taskSnapshot: tasks });
+    useSessionStore.getState().setIsPlayingAudio("test-server", true);
+    useSessionStore
+      .getState()
+      .setAgentStreamState("test-server", "agent-1", { taskSnapshot: [...tasks] });
+    useSessionStore.getState().setAgentStreamState("test-server", "agent-1", {
+      taskSnapshot: [{ ...tasks[0], status: "completed", completed: true }],
+    });
+    unsubscribe();
+
+    expect(snapshots).toEqual([["Inspect"], ["Inspect"]]);
+  });
+
+  it("restores the latest task snapshot from an authoritative timeline", () => {
+    initializeTestSession();
+    const todo: StreamItem = {
+      kind: "todo_list",
+      id: "todo-1",
+      provider: "codex",
+      timestamp: new Date("2026-08-11T10:00:00.000Z"),
+      activity: { type: "started", task: "Verify" },
+      items: [{ text: "Verify", status: "in_progress", completed: false }],
+    };
+
+    useSessionStore.getState().applyAgentTimelineResponseState("test-server", "agent-1", {
+      items: [todo],
+      head: [],
+      range: null,
+      older: "none",
+      newer: false,
+      synchronized: true,
+      acknowledgedClientMessageIds: [],
+    });
+
+    expect(useSessionStore.getState().sessions["test-server"]?.agentTasks.get("agent-1")).toEqual(
+      todo.items,
+    );
+  });
+});
 
 describe("agent timeline state", () => {
   it("commits canonical items, range, and older availability as one synced state", () => {
@@ -692,31 +747,5 @@ describe("removeWorkspace", () => {
     expect(after.sessions).toBe(before.sessions);
     expect(after.session).toBe(before.session);
     expect(after.workspaces).toBe(before.workspaces);
-  });
-});
-
-describe("patchWorkspaceScripts", () => {
-  it("preserves workspace entry identity when scripts are content-equal", () => {
-    const script = {
-      scriptName: "web",
-      type: "service" as const,
-      hostname: "web.paseo.localhost",
-      port: 3000,
-      proxyUrl: "http://web.paseo.localhost:6767",
-      lifecycle: "running" as const,
-      health: "healthy" as const,
-      exitCode: null,
-      terminalId: null,
-    };
-    const workspace = createWorkspace({ id: "/repo/main", scripts: [script] });
-    const current = new Map([[workspace.id, workspace]]);
-
-    const next = patchWorkspaceScripts(current, {
-      workspaceId: workspace.id,
-      scripts: [{ ...script }],
-    });
-
-    expect(next).toBe(current);
-    expect(next.get(workspace.id)).toBe(workspace);
   });
 });

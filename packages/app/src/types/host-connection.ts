@@ -7,10 +7,16 @@ import {
   type DirectTcpHostConnection,
 } from "@getpaseo/protocol/host-connection-schema";
 import {
+  DEFAULT_SSH_DAEMON_PORT,
+  validatePort,
+  validateSshHost,
+} from "@getpaseo/protocol/ssh-transport";
+import {
   type HostAppearance,
   defaultHostAppearance,
-  normalizeStoredHostAppearance,
+  HostAppearanceSchema,
 } from "@/hosts/appearance";
+import { z } from "zod";
 
 export { DirectTcpHostConnectionSchema, type DirectTcpHostConnection };
 
@@ -26,6 +32,14 @@ export interface DirectPipeHostConnection {
   path: string;
 }
 
+export interface RemoteSshHostConnection {
+  id: string;
+  type: "remoteSsh";
+  host: string;
+  sshPort?: number;
+  daemonPort?: number;
+}
+
 export interface RelayHostConnection {
   id: string;
   type: "relay";
@@ -38,6 +52,7 @@ export type HostConnection =
   | DirectTcpHostConnection
   | DirectSocketHostConnection
   | DirectPipeHostConnection
+  | RemoteSshHostConnection
   | RelayHostConnection;
 
 export type HostLifecycle = Record<string, never>;
@@ -122,6 +137,9 @@ function hostConnectionEquals(left: HostConnection, right: HostConnection): bool
   if (left.type === "directPipe" && right.type === "directPipe") {
     return left.path === right.path;
   }
+  if (left.type === "remoteSsh" && right.type === "remoteSsh") {
+    return remoteSshConnectionEquals(left, right);
+  }
   if (left.type === "relay" && right.type === "relay") {
     return (
       left.relayEndpoint === right.relayEndpoint &&
@@ -131,6 +149,17 @@ function hostConnectionEquals(left: HostConnection, right: HostConnection): bool
   }
 
   return false;
+}
+
+function remoteSshConnectionEquals(
+  left: RemoteSshHostConnection,
+  right: RemoteSshHostConnection,
+): boolean {
+  return (
+    left.host === right.host &&
+    left.sshPort === right.sshPort &&
+    left.daemonPort === right.daemonPort
+  );
 }
 
 function hostLifecycleEquals(left: HostLifecycle, right: HostLifecycle): boolean {
@@ -293,54 +322,121 @@ export function connectionFromListen(listen: string): HostConnection | null {
   }
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+export function createRemoteSshHostConnection(input: {
+  host: string;
+  sshPort?: number;
+  daemonPort?: number;
+}): RemoteSshHostConnection {
+  const host = validateSshHost(input.host);
+  const sshPort = input.sshPort === undefined ? undefined : validatePort(input.sshPort, "SSH port");
+
+  const daemonPort =
+    input.daemonPort === undefined || input.daemonPort === DEFAULT_SSH_DAEMON_PORT
+      ? undefined
+      : validatePort(input.daemonPort, "Daemon port");
+
+  const id = [
+    "ssh",
+    encodeURIComponent(host),
+    sshPort === undefined ? "" : String(sshPort),
+    daemonPort === undefined ? "" : String(daemonPort),
+  ].join(":");
+
+  return {
+    id,
+    type: "remoteSsh",
+    host,
+    ...(sshPort !== undefined ? { sshPort } : {}),
+    ...(daemonPort !== undefined ? { daemonPort } : {}),
+  };
 }
 
-function toObjectRecord(value: unknown): Record<string, unknown> | undefined {
-  return isPlainRecord(value) ? value : undefined;
-}
+const StoredHostConnectionSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    id: z.string().optional(),
+    type: z.literal("directTcp"),
+    endpoint: z.string(),
+    useTls: z.boolean().optional(),
+    password: z.string().optional(),
+  }),
+  z.strictObject({
+    id: z.string().optional(),
+    type: z.literal("directSocket"),
+    path: z.string(),
+  }),
+  z.strictObject({
+    id: z.string().optional(),
+    type: z.literal("directPipe"),
+    path: z.string(),
+  }),
+  z.strictObject({
+    id: z.string().optional(),
+    type: z.literal("remoteSsh"),
+    host: z.string(),
+    sshPort: z.number().optional(),
+    daemonPort: z.number().optional(),
+  }),
+  z.strictObject({
+    id: z.string().optional(),
+    type: z.literal("relay"),
+    relayEndpoint: z.string(),
+    useTls: z.boolean().optional(),
+    daemonPublicKeyB64: z.string(),
+  }),
+]);
+const StoredHostProfileSchema = z.strictObject({
+  serverId: z.string().trim().min(1),
+  label: z.string().optional(),
+  appearance: HostAppearanceSchema.optional(),
+  lifecycle: z.strictObject({}).optional(),
+  connections: z.array(StoredHostConnectionSchema).min(1),
+  preferredConnectionId: z.string().nullable().optional(),
+  createdAt: z.string().datetime({ offset: true }).optional(),
+  updatedAt: z.string().datetime({ offset: true }).optional(),
+});
+export const StoredHostRegistrySchema = z.array(StoredHostProfileSchema);
+type StoredHostConnection = z.infer<typeof StoredHostConnectionSchema>;
 
-function normalizeStoredConnection(connection: unknown): HostConnection | null {
-  const record = toObjectRecord(connection);
-  if (!record) {
-    return null;
-  }
-  const type = record.type;
-  if (type === "directTcp") {
+function normalizeStoredConnection(connection: StoredHostConnection): HostConnection | null {
+  if (connection.type === "directTcp") {
     try {
-      const endpoint = normalizeLoopbackToLocalhost(
-        normalizeHostPort(typeof record.endpoint === "string" ? record.endpoint : ""),
-      );
+      const endpoint = normalizeLoopbackToLocalhost(normalizeHostPort(connection.endpoint));
       return DirectTcpHostConnectionSchema.parse({
         id: `direct:${endpoint}`,
         type: "directTcp",
         endpoint,
-        useTls: record.useTls,
-        ...(typeof record.password === "string" ? { password: record.password } : {}),
+        useTls: connection.useTls,
+        ...(connection.password !== undefined ? { password: connection.password } : {}),
       });
     } catch {
       return null;
     }
   }
-  if (type === "directSocket") {
-    const path = (typeof record.path === "string" ? record.path : "").trim();
+  if (connection.type === "directSocket") {
+    const path = connection.path.trim();
     return path ? { id: `socket:${path}`, type: "directSocket", path } : null;
   }
-  if (type === "directPipe") {
-    const path = (typeof record.path === "string" ? record.path : "").trim();
+  if (connection.type === "directPipe") {
+    const path = connection.path.trim();
     return path ? { id: `pipe:${path}`, type: "directPipe", path } : null;
   }
-  if (type === "relay") {
+  if (connection.type === "remoteSsh") {
     try {
-      const relayEndpoint = normalizeHostPort(
-        typeof record.relayEndpoint === "string" ? record.relayEndpoint : "",
-      );
-      const daemonPublicKeyB64 = (
-        typeof record.daemonPublicKeyB64 === "string" ? record.daemonPublicKeyB64 : ""
-      ).trim();
+      return createRemoteSshHostConnection({
+        host: connection.host,
+        ...(connection.sshPort !== undefined ? { sshPort: connection.sshPort } : {}),
+        ...(connection.daemonPort !== undefined ? { daemonPort: connection.daemonPort } : {}),
+      });
+    } catch {
+      return null;
+    }
+  }
+  if (connection.type === "relay") {
+    try {
+      const relayEndpoint = normalizeHostPort(connection.relayEndpoint);
+      const daemonPublicKeyB64 = connection.daemonPublicKeyB64.trim();
       if (!daemonPublicKeyB64) return null;
-      const useTls = typeof record.useTls === "boolean" ? record.useTls : undefined;
+      const useTls = connection.useTls;
       return {
         id: useTls === true ? `relay:wss:${relayEndpoint}` : `relay:${relayEndpoint}`,
         type: "relay",
@@ -357,17 +453,14 @@ function normalizeStoredConnection(connection: unknown): HostConnection | null {
 }
 
 export function normalizeStoredHostProfile(entry: unknown): HostProfile | null {
-  const record = toObjectRecord(entry);
-  if (!record) {
+  const result = StoredHostProfileSchema.safeParse(entry);
+  if (!result.success) {
     return null;
   }
-  const serverId = typeof record.serverId === "string" ? record.serverId.trim() : "";
-  if (!serverId) {
-    return null;
-  }
+  const record = result.data;
+  const serverId = record.serverId;
 
-  const rawConnections = Array.isArray(record.connections) ? record.connections : [];
-  const connections = rawConnections
+  const connections = record.connections
     .map((connection) => normalizeStoredConnection(connection))
     .filter((connection): connection is HostConnection => connection !== null);
   if (connections.length === 0) {
@@ -375,12 +468,10 @@ export function normalizeStoredHostProfile(entry: unknown): HostProfile | null {
   }
 
   const now = new Date().toISOString();
-  const label = normalizeHostLabel(
-    typeof record.label === "string" ? record.label : null,
-    serverId,
-  );
+  const label = normalizeHostLabel(record.label, serverId);
   const preferredConnectionId =
-    typeof record.preferredConnectionId === "string" &&
+    record.preferredConnectionId !== null &&
+    record.preferredConnectionId !== undefined &&
     connections.some((connection) => connection.id === record.preferredConnectionId)
       ? record.preferredConnectionId
       : (connections[0]?.id ?? null);
@@ -388,12 +479,12 @@ export function normalizeStoredHostProfile(entry: unknown): HostProfile | null {
   return {
     serverId,
     label,
-    appearance: normalizeStoredHostAppearance(record.appearance),
+    appearance: record.appearance ?? defaultHostAppearance(),
     lifecycle: defaultLifecycle(),
     connections,
     preferredConnectionId,
-    createdAt: typeof record.createdAt === "string" ? record.createdAt : now,
-    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : now,
+    createdAt: record.createdAt ?? now,
+    updatedAt: record.updatedAt ?? now,
   };
 }
 

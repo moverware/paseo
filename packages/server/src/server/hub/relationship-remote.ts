@@ -7,16 +7,24 @@ export interface HubEnrollment {
   idempotencyKey: string;
   hubOrigin: string;
   token: string;
+  hostname: string;
   serverId: string;
   daemonPublicKey: string;
   credentialVerifier: string;
-  scopes: string[];
+  permissions: string[];
 }
 
 export interface HubEnrollmentResult {
   daemonId: string;
-  scopes: string[];
+  permissions: string[];
   webSocketUrl: string;
+}
+
+export interface HubPermissionUpdate {
+  daemonId: string;
+  hubOrigin: string;
+  credential: string;
+  permissions: string[];
 }
 
 export interface HubRevocation {
@@ -32,7 +40,7 @@ export interface HubSocketCredentials {
 }
 
 export interface HubSocketEvents {
-  connected(socket: WebSocketLike): void;
+  connected(socket: WebSocketLike, sessionProtocol: "legacy" | "session-v1"): void;
   rejected(statusCode: 401 | 403): void;
   closed(code: number): void;
   failed(error: Error): void;
@@ -44,6 +52,7 @@ export interface HubSocketConnection {
 
 export interface HubRelationshipRemote {
   enroll(input: HubEnrollment): Promise<HubEnrollmentResult>;
+  updatePermissions(input: HubPermissionUpdate): Promise<{ permissions: string[] }>;
   revoke(input: HubRevocation): Promise<void>;
   openSocket(input: HubSocketCredentials, events: HubSocketEvents): HubSocketConnection;
 }
@@ -57,7 +66,7 @@ export class HubEnrollmentRejectedError extends Error {
 
 const EnrollmentResultSchema = z.object({
   daemonId: z.string(),
-  scopes: z.array(z.string()),
+  permissions: z.array(z.string()),
   webSocketUrl: z
     .string()
     .url()
@@ -96,10 +105,11 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
         body: JSON.stringify({
           daemonId: input.daemonId,
           idempotencyKey: input.idempotencyKey,
+          hostname: input.hostname,
           serverId: input.serverId,
           daemonPublicKey: input.daemonPublicKey,
           credentialVerifier: input.credentialVerifier,
-          scopes: input.scopes,
+          permissions: input.permissions,
         }),
         signal,
       });
@@ -112,6 +122,25 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
       const enrollment = EnrollmentResultSchema.parse(await response.json());
       ensureWebSocketMatchesHubOrigin(input.hubOrigin, enrollment.webSocketUrl);
       return enrollment;
+    });
+  }
+
+  async updatePermissions(input: HubPermissionUpdate): Promise<{ permissions: string[] }> {
+    return this.withRequestTimeout(async (signal) => {
+      const response = await fetch(
+        `${input.hubOrigin}/api/daemons/${encodeURIComponent(input.daemonId)}`,
+        {
+          method: "PATCH",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${input.credential}`,
+          },
+          body: JSON.stringify({ permissions: input.permissions }),
+          signal,
+        },
+      );
+      if (!response.ok) throw new Error(`Hub permission update failed (${response.status})`);
+      return z.object({ permissions: z.array(z.string()) }).parse(await response.json());
     });
   }
 
@@ -132,16 +161,23 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
   }
 
   openSocket(input: HubSocketCredentials, events: HubSocketEvents): HubSocketConnection {
+    let sessionProtocol: "legacy" | "session-v1" = "legacy";
     const socket = new WebSocket(input.webSocketUrl, {
       handshakeTimeout: this.requestTimeoutMs,
       headers: {
         authorization: `Bearer ${input.credential}`,
         "x-paseo-daemon-id": input.daemonId,
+        "x-paseo-session-protocol": "1",
       },
     });
     let settled = false;
+    socket.once("upgrade", (response) => {
+      if (response.headers["x-paseo-session-protocol"] === "1") {
+        sessionProtocol = "session-v1";
+      }
+    });
     socket.once("open", () => {
-      if (!settled) events.connected(socket as WebSocketLike);
+      if (!settled) events.connected(socket as WebSocketLike, sessionProtocol);
     });
     socket.once("unexpected-response", (_request, response) => {
       if (settled) {

@@ -9,6 +9,7 @@ import path from "node:path";
 import { expect, test, vi } from "vitest";
 
 import { Session, type SessionOptions } from "./session.js";
+import { OWNER_PERMISSIONS } from "./authorization/index.js";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
@@ -88,12 +89,12 @@ function createHarness(input: {
 
   const session = new Session({
     clientId: "test",
-    scopes: ["*"],
+    permissions: OWNER_PERMISSIONS,
     appVersion: null,
     onMessage: (m) => emitted.push(m),
     logger: createStub<SessionOptions["logger"]>(logger),
     downloadTokenStore: createStub<SessionOptions["downloadTokenStore"]>({}),
-    pushTokenStore: createStub<SessionOptions["pushTokenStore"]>({}),
+    pushNotifications: createStub<SessionOptions["pushNotifications"]>({}),
     paseoHome: mkdtempSync(path.join(tmpdir(), "paseo-invariant-test-")),
     agentManager: createStub<SessionOptions["agentManager"]>({
       subscribe: () => () => {},
@@ -159,9 +160,7 @@ function createHarness(input: {
       },
     }),
     filesystem: { isDirectory: async () => true },
-    chatService: createStub<SessionOptions["chatService"]>({}),
     scheduleService: createStub<SessionOptions["scheduleService"]>({}),
-    loopService: createStub<SessionOptions["loopService"]>({}),
     checkoutDiffManager: createStub<SessionOptions["checkoutDiffManager"]>({
       subscribe: async () => ({
         initial: { cwd: "/tmp", files: [], error: null },

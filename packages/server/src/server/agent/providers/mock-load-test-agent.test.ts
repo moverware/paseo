@@ -68,6 +68,47 @@ describe("MockLoadTestAgentClient", () => {
     await session.interrupt();
   });
 
+  test("streams a configured assistant response through the normal timeline", async () => {
+    vi.useFakeTimers();
+    const response = [
+      "```mermaid",
+      "flowchart LR",
+      "  Start --> Middle",
+      '  Middle --> End["<i>Done</i>"]',
+      "```",
+    ].join("\n");
+    const client = new MockLoadTestAgentClient();
+    const session = await client.createSession({
+      provider: "mock",
+      cwd: process.cwd(),
+      model: "ten-second-stream",
+      featureValues: {
+        mockStreamingAssistantResponse: response,
+        mockStreamingAssistantIntervalMs: 20,
+      },
+    });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const resultPromise = session.run("Render a diagram while streaming.");
+    await vi.runAllTimersAsync();
+
+    await expect(resultPromise).resolves.toMatchObject({ finalText: response, canceled: false });
+    const streamedText = events
+      .flatMap((event) =>
+        event.type === "timeline" && event.item.type === "assistant_message"
+          ? [event.item.text]
+          : [],
+      )
+      .join("");
+    expect(streamedText).toBe(response);
+    expect(
+      events.filter((event) => event.type === "timeline" && event.item.type === "assistant_message")
+        .length,
+    ).toBeGreaterThan(5);
+    expect(events.at(-1)).toMatchObject({ type: "turn_completed", provider: "mock" });
+  });
+
   test("can withhold the provider user-message echo until an immediate interrupt", async () => {
     vi.useFakeTimers();
     const client = new MockLoadTestAgentClient();
@@ -383,6 +424,31 @@ describe("MockLoadTestAgentClient", () => {
     unsubscribe();
   });
 
+  test("uses one continuous assistant stream for bursty rendering measurements", async () => {
+    vi.useFakeTimers();
+    const client = new MockLoadTestAgentClient();
+    const session = await client.createSession({
+      provider: "mock",
+      cwd: process.cwd(),
+      model: "bursty-stream",
+    });
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = session.subscribe((event) => events.push(event));
+
+    await session.startTurn("Measure paced rendering.");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const timelineItems = events.flatMap((event) =>
+      event.type === "timeline" ? [event.item] : [],
+    );
+    expect(timelineItems.filter((item) => item.type === "assistant_message")).not.toHaveLength(0);
+    expect(
+      timelineItems.filter((item) => item.type === "reasoning" || item.type === "tool_call"),
+    ).toEqual([]);
+    await session.interrupt();
+    unsubscribe();
+  });
+
   test("emits a settled assistant Markdown image path selected by prompt", async () => {
     vi.useFakeTimers();
     const client = new MockLoadTestAgentClient();
@@ -464,11 +530,13 @@ describe("MockLoadTestAgentClient", () => {
         .reduce((max, length) => Math.max(max, length), 0);
       expect(longestMessage).toBeGreaterThan(20);
 
-      // First message includes the cycle header.
-      expect(assistantMessages[0]).toMatchObject({
-        type: "assistant_message",
-        text: expect.stringContaining("## Cycle 1"),
-      });
+      // The cycle header is at the start of the stream. It can straddle the first
+      // two messages, because the coalescer flushes the leading token of a burst
+      // on its own before batching the rest.
+      const assistantText = assistantMessages
+        .map((item) => (item.type === "assistant_message" ? item.text : ""))
+        .join("");
+      expect(assistantText).toContain("## Cycle 1");
 
       // Tool calls land in expected order at least once.
       const runningTools = toolCalls

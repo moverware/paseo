@@ -91,6 +91,24 @@ describe("codex tool-call mapper", () => {
     });
   });
 
+  it("keeps a quoted PowerShell payload intact after removing launch flags", () => {
+    const item = expectMapped(
+      mapCodexToolCallFromThreadItem({
+        type: "commandExecution",
+        id: "codex-call-wrapper-powershell-quoted-payload",
+        status: "running",
+        command: "powershell.exe -NoProfile -Command \"Get-ChildItem 'C:\\work space'\"",
+        cwd: "C:\\repo",
+      }),
+    );
+
+    expect(item.detail).toEqual({
+      type: "shell",
+      command: "Get-ChildItem 'C:\\work space'",
+      cwd: "C:\\repo",
+    });
+  });
+
   it("unwraps cmd wrapper arrays for commandExecution on Windows", () => {
     const item = expectMapped(
       mapCodexToolCallFromThreadItem({
@@ -376,6 +394,28 @@ describe("codex tool-call mapper", () => {
         log: "",
         actions: [],
       },
+    });
+  });
+
+  it.each([
+    ["shutdown", "canceled"],
+    ["notFound", "failed"],
+  ] as const)("maps terminal child state %s to %s", (childStatus, expectedStatus) => {
+    const item = mapCodexToolCallFromThreadItem({
+      type: "collabAgentToolCall",
+      id: `call-sub-agent-${childStatus}`,
+      tool: "closeAgent",
+      status: "completed",
+      receiverThreadIds: ["child-thread-1"],
+      agentsStates: {
+        "child-thread-1": { status: childStatus, message: null },
+      },
+    });
+
+    expect(item).toMatchObject({
+      type: "tool_call",
+      callId: `call-sub-agent-${childStatus}`,
+      status: expectedStatus,
     });
   });
 
