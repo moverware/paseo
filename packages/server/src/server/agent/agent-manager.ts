@@ -4191,6 +4191,14 @@ export class AgentManager {
         this.emitState(agent);
       }
     }
+    // FORK: a session created fresh has no transcript path at registration
+    // (the provider mints its id on its first message), so the tail armed
+    // there is a no-op. Arm it now that the path exists; a session whose id
+    // changed mid-stream moves onto the new file the same way. Without this
+    // a phone-born agent adopted into a pane after its first turn streamed
+    // nothing until a reload — its whole next turn read as one silent
+    // "thinking" stretch (measured 2026-09-04: 6.5 min, 35 tool calls).
+    this.transcriptTailer.ensureArmed(agent.id, agent.session);
     void this.refreshRuntimeInfo(agent);
   }
 

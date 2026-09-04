@@ -133,11 +133,28 @@ export class TranscriptTailer {
       resyncTimer: null,
     };
     this.tailed.set(agentId, state);
+    this.logger.info({ agentId, path, offset: state.offset }, "transcript tail armed");
     // Stat polling, not fs.watch: it tolerates the file not existing yet and
     // survives atomic replaces, at a latency that is fine for a chat timeline.
     fs.watchFile(path, { interval: this.pollIntervalMs }, () => {
       this.consume(agentId);
     });
+  }
+
+  /** Arm only if this agent is not already tailing the session's current
+   * transcript. Unlike `arm`, an already-armed agent is left alone — no
+   * resync — so this is safe to call on every stream event that might have
+   * revealed a transcript path for the first time. */
+  ensureArmed(agentId: string, session: AgentSession): void {
+    const path = session.externalTranscriptPath?.();
+    if (!path) {
+      return;
+    }
+    const existing = this.tailed.get(agentId);
+    if (existing && existing.path === path && existing.session === session) {
+      return;
+    }
+    this.arm(agentId, session);
   }
 
   /** Bytes of the transcript this tailer has already consumed. Tests wait on

@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -4567,6 +4567,84 @@ test("archiveSnapshot dispatches archived state for stored-only agents", async (
   const last = events[events.length - 1];
   expect(last.id).toBe(created.id);
   expect(last.lifecycle).toBe("closed");
+});
+
+test("createAgent arms the transcript tail once thread_started reveals the session id", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-late-tail-"));
+  const transcriptPath = join(workdir, "session.jsonl");
+  const ingested: string[] = [];
+
+  // A freshly created provider session has no id — and so no transcript —
+  // until its first message; the tail armed at registration is a no-op.
+  class LateTranscriptSession extends TestAgentSession {
+    private sessionIdKnown = false;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = "late-turn";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.sessionIdKnown = true;
+        this.pushEvent({ type: "thread_started", provider: this.provider, sessionId: this.id });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      }, 0);
+      return { turnId };
+    }
+
+    override describePersistence() {
+      return this.sessionIdKnown ? { provider: this.provider, sessionId: this.id } : null;
+    }
+
+    override async getRuntimeInfo() {
+      return {
+        provider: this.provider,
+        sessionId: this.sessionIdKnown ? this.id : null,
+        model: null,
+        modeId: null,
+      };
+    }
+
+    externalTranscriptPath(): string | null {
+      return this.sessionIdKnown ? transcriptPath : null;
+    }
+
+    ingestExternalTranscriptLines(content: string): void {
+      ingested.push(content);
+    }
+  }
+
+  class LateTranscriptClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new LateTranscriptSession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new LateTranscriptClient() },
+    logger,
+  });
+
+  let agentId: string | null = null;
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {});
+    agentId = snapshot.id;
+    await manager.runAgent(snapshot.id, "hello");
+    await vi.waitFor(() => {
+      expect(manager.getAgent(snapshot.id)?.persistence?.sessionId).toBeTruthy();
+    });
+
+    writeFileSync(transcriptPath, "");
+    appendFileSync(transcriptPath, '{"type":"assistant"}\n');
+    // The tail polls at its default interval; a no-op arm never delivers.
+    await vi.waitFor(
+      () => {
+        expect(ingested.join("")).toContain('{"type":"assistant"}');
+      },
+      { timeout: 8_000 },
+    );
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("reloadAgentSession cancels active run and resumes existing session once thread_started is observed", async () => {
