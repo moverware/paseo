@@ -1580,6 +1580,35 @@ describe("Codex app-server provider", () => {
     appServer.assertNoErrors();
   });
 
+  test("treats a readable Codex thread whose writer a pane holds as unarchived", async () => {
+    const threadRequests: Array<{ method: string; params: unknown }> = [];
+    const appServer = createFakeCodexAppServer({
+      "thread/unarchive": (params) => {
+        threadRequests.push({ method: "thread/unarchive", params });
+        return Promise.reject(new Error("thread pane-thread-id already has an active writer"));
+      },
+      "thread/read": (params) => {
+        threadRequests.push({ method: "thread/read", params });
+        return { thread: { id: "pane-thread-id", turns: [] } };
+      },
+    });
+    const provider = new CodexAppServerAgentClient(createTestLogger());
+    castInternals<{ spawnAppServer: () => Promise<ChildProcessWithoutNullStreams> }>(
+      provider,
+    ).spawnAppServer = async () => appServer.child;
+
+    await provider.unarchiveNativeSession({
+      provider: "codex",
+      sessionId: "pane-thread-id",
+    });
+
+    expect(threadRequests).toEqual([
+      { method: "thread/unarchive", params: { threadId: "pane-thread-id" } },
+      { method: "thread/read", params: { threadId: "pane-thread-id" } },
+    ]);
+    appServer.assertNoErrors();
+  });
+
   test("treats a readable Codex thread as already unarchived", async () => {
     const threadRequests: Array<{ method: string; params: unknown }> = [];
     const appServer = createFakeCodexAppServer({

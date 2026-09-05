@@ -7424,7 +7424,18 @@ export class CodexAppServerAgentClient implements AgentClient {
       try {
         await client.request("thread/unarchive", { threadId });
       } catch (error) {
-        if (!isCodexAlreadyUnarchivedError(error, threadId)) throw error;
+        // FORK: a thread whose writer an external pane holds refuses
+        // thread/unarchive outright, exactly like one that was never archived
+        // refuses with "no archived rollout". Either way thread/read settles
+        // whether the thread is there to restore; without this, a mirror row
+        // archived by mistake could never be unarchived while its pane lived
+        // (2026-09-05, personal/home codex pane).
+        if (
+          !isCodexAlreadyUnarchivedError(error, threadId) &&
+          !isActiveWriterCodexThreadResumeError(error, threadId)
+        ) {
+          throw error;
+        }
         try {
           await client.request("thread/read", { threadId });
         } catch {
