@@ -710,6 +710,14 @@ export interface AgentSession {
    * transcript carries.
    */
   isExternalTurnActive?(): boolean;
+  /**
+   * True when a turn ending now is handing off to an external process that
+   * has already reported its own turn running: the session will open that
+   * external turn as soon as this one finalizes. Lets the manager keep the
+   * agent running across the boundary instead of painting an idle frame
+   * clients act on.
+   */
+  expectsExternalContinuation?(): boolean;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;

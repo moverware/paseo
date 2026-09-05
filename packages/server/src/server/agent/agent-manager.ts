@@ -2448,9 +2448,23 @@ export class AgentManager {
     mutableAgent.activeForegroundTurnId = null;
     this.applyActiveTurnTerminal(mutableAgent, turnId);
     const terminalError = mutableAgent.lastError;
+    // FORK: a routed turn (the prompt hook refused it and typed it into the
+    // pane) ends while the pane has already reported ITS turn running. The
+    // session opens that external turn the moment its foreground turn ends,
+    // so by the time this finalize runs off the event queue the external
+    // turn is usually already active, and otherwise still deferred. Either
+    // way the agent is not idle. Without holding here it painted one idle
+    // frame in between, and the phone app reads idle as "queue released":
+    // it re-sent the message it had just delivered, which landed in the
+    // pane's composer queue and was absorbed into the running turn — every
+    // interrupt-mode message arrived twice (2026-09-05).
+    const shouldHoldBusyForExternalContinuation =
+      !terminalError &&
+      (mutableAgent.session.isExternalTurnActive?.() === true ||
+        mutableAgent.session.expectsExternalContinuation?.() === true);
     const shouldHoldBusyForReplacement = mutableAgent.pendingReplacement && !terminalError;
     let nextLifecycle: "running" | "error" | "idle";
-    if (shouldHoldBusyForReplacement) {
+    if (shouldHoldBusyForReplacement || shouldHoldBusyForExternalContinuation) {
       nextLifecycle = "running";
     } else if (terminalError) {
       nextLifecycle = "error";
@@ -2478,7 +2492,7 @@ export class AgentManager {
       },
       "agent.manager.finalize",
     );
-    if (!shouldHoldBusyForReplacement) {
+    if (!shouldHoldBusyForReplacement && !shouldHoldBusyForExternalContinuation) {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
     }

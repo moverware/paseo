@@ -2646,6 +2646,10 @@ class ClaudeAgentSession implements AgentSession {
     return this.autonomousTurn?.external === true;
   }
 
+  expectsExternalContinuation(): boolean {
+    return this.deferredExternalTurn;
+  }
+
   /**
    * Slash commands for an externally-driven agent are delivered to the
    * external process instead of run here. Built-in commands like /model

@@ -51,15 +51,29 @@ class ExternalTurnSession implements AgentSession {
 
   constructor(private readonly config: AgentSessionConfig) {}
 
+  /** When set, startTurn opens the foreground turn but leaves it to
+   * `finishForegroundTurn` to end — models a routed turn whose hook block
+   * lands after the pane has reported its own turn. */
+  holdForegroundTurn = false;
+  private activeForegroundTurnId: string | null = null;
+  private deferredExternalTurn = false;
+
   noteExternalTurn(state: ExternalTurnState): void {
     if (state === "running" || state === "activity") {
       if (this.externalTurnId) {
+        return;
+      }
+      if (this.activeForegroundTurnId) {
+        // ClaudeAgentSession defers a report that arrives mid daemon turn and
+        // opens the external turn once the daemon turn finalizes.
+        this.deferredExternalTurn = true;
         return;
       }
       this.externalTurnId = `external-${++this.turnCounter}`;
       this.emit({ type: "turn_started", provider: this.provider });
       return;
     }
+    this.deferredExternalTurn = false;
     if (!this.externalTurnId) {
       return;
     }
@@ -73,12 +87,30 @@ class ExternalTurnSession implements AgentSession {
     return this.externalTurnId !== null;
   }
 
+  expectsExternalContinuation(): boolean {
+    return this.deferredExternalTurn;
+  }
+
+  finishForegroundTurn(): void {
+    const turnId = this.activeForegroundTurnId;
+    if (!turnId) return;
+    this.activeForegroundTurnId = null;
+    this.emit({ type: "turn_completed", provider: this.provider, turnId });
+    if (this.deferredExternalTurn) {
+      this.deferredExternalTurn = false;
+      this.noteExternalTurn("running");
+    }
+  }
+
   async startTurn(prompt: unknown): Promise<{ turnId: string }> {
     this.startedPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
     const turnId = `foreground-${++this.turnCounter}`;
+    this.activeForegroundTurnId = turnId;
     setTimeout(() => {
       this.emit({ type: "turn_started", provider: this.provider, turnId });
-      this.emit({ type: "turn_completed", provider: this.provider, turnId });
+      if (!this.holdForegroundTurn) {
+        this.finishForegroundTurn();
+      }
     }, 0);
     return { turnId };
   }
@@ -258,6 +290,53 @@ describe("external turns in the agent manager", () => {
     expect(result.disposition).toBe("turn_started");
     expect(fixture.session.startedPrompts).toEqual(["from the phone"]);
     expect(fixture.session.isExternalTurnActive()).toBe(false);
+  });
+
+  test("a routed turn hands off to the pane's turn without an idle frame in between", async () => {
+    // Interrupt-mode phone message into a live pane: the daemon turn is
+    // refused by the prompt hook and typed into the pane, whose own prompt
+    // hook reports running BEFORE the daemon turn's hook block lands. The
+    // phone must never see idle across that boundary — it reads idle as the
+    // queue being released and re-sends the message it just delivered
+    // (measured 2026-09-05: every interrupt-mode message arrived twice).
+    fixture = await createFixture();
+    const statuses: string[] = [];
+    let recording = false;
+    const unsubscribe = fixture.manager.subscribe((event) => {
+      if (recording && event.type === "agent_state" && event.agent.id === fixture!.agentId) {
+        statuses.push(toAgentPayload(event.agent).status);
+      }
+    });
+    try {
+      fixture.session.holdForegroundTurn = true;
+      const result = await startAgentRun(
+        fixture.manager,
+        fixture.agentId,
+        "from the phone",
+        logger,
+      );
+      expect(result.disposition).toBe("turn_started");
+      await settle();
+      expect(fixture.status()).toBe("running");
+      recording = true;
+
+      // The pane accepted the routed prompt and reported its turn.
+      fixture.manager.reportExternalTurn(fixture.agentId, "running");
+      await settle();
+      // Now the daemon turn's hook block lands.
+      fixture.session.finishForegroundTurn();
+      await settle();
+
+      expect(fixture.session.isExternalTurnActive()).toBe(true);
+      expect(fixture.status()).toBe("running");
+      expect(statuses).not.toContain("idle");
+
+      fixture.manager.reportExternalTurn(fixture.agentId, "idle");
+      await settle();
+      expect(fixture.status()).toBe("idle");
+    } finally {
+      unsubscribe();
+    }
   });
 
   test("releasing an external turn frees the run slot without interrupting the pane", async () => {
