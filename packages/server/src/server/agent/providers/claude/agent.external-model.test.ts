@@ -138,3 +138,77 @@ describe("mirroring the external process's model", () => {
     }
   });
 });
+
+/**
+ * The tail reads the same file this daemon's own child writes. Anything the
+ * child already streamed live must not come back through the tail as a second
+ * copy, and a batch made only of such lines must not open an external turn.
+ */
+describe("tailed lines the daemon already streamed", () => {
+  test("drops a tailed entry whose uuid was seen live, and emits one it was not", async () => {
+    const session = await createSession("claude-sonnet-4-6");
+    const events: Array<{ type: string; item?: { type: string; text?: string } }> = [];
+    const unsubscribe = session.subscribe((event) => {
+      events.push(event as (typeof events)[number]);
+    });
+    try {
+      const internal = session as unknown as {
+        routeSdkMessageFromPump(message: unknown): Promise<void>;
+      };
+      // What the pump sees when the child answers: an assistant message with
+      // the transcript uuid Claude Code stamps on the on-disk entry.
+      await internal.routeSdkMessageFromPump({
+        type: "assistant",
+        uuid: "11111111-1111-4111-8111-111111111111",
+        session_id: "s",
+        message: {
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [{ type: "text", text: "live answer" }],
+        },
+      });
+      const liveCount = events.filter(
+        (e) => e.type === "timeline" && e.item?.type === "assistant_message",
+      ).length;
+      expect(liveCount).toBe(1);
+      const turnStartsBefore = events.filter((e) => e.type === "turn_started").length;
+
+      // The provider flushes that same entry to disk; the tail reads it back.
+      session.ingestExternalTranscriptLines?.(
+        `${JSON.stringify({
+          type: "assistant",
+          uuid: "11111111-1111-4111-8111-111111111111",
+          message: {
+            role: "assistant",
+            model: "claude-sonnet-4-6",
+            content: [{ type: "text", text: "live answer" }],
+          },
+        })}\n`,
+      );
+      expect(
+        events.filter((e) => e.type === "timeline" && e.item?.type === "assistant_message"),
+      ).toHaveLength(1);
+      expect(events.filter((e) => e.type === "turn_started")).toHaveLength(turnStartsBefore);
+
+      // A genuinely external entry still streams.
+      session.ingestExternalTranscriptLines?.(
+        `${JSON.stringify({
+          type: "assistant",
+          uuid: "22222222-2222-4222-8222-222222222222",
+          message: {
+            role: "assistant",
+            model: "claude-sonnet-4-6",
+            content: [{ type: "text", text: "pane answer" }],
+          },
+        })}\n`,
+      );
+      const texts = events
+        .filter((e) => e.type === "timeline" && e.item?.type === "assistant_message")
+        .map((e) => e.item?.text);
+      expect(texts).toEqual(["live answer", "pane answer"]);
+    } finally {
+      unsubscribe();
+      await session.close();
+    }
+  });
+});

@@ -808,6 +808,7 @@ export function sliceHistoryToRecentTurns<T extends { item: AgentTimelineItem }>
 /** How long after an external idle report tailed lines are treated as that
  * turn's trailing flush rather than a new turn. */
 const EXTERNAL_IDLE_SETTLE_MS = 15_000;
+const LIVE_TRANSCRIPT_UUID_LIMIT = 2_000;
 
 const HOOK_BLOCK_PREFIX = "UserPromptSubmit operation blocked by hook:\n";
 
@@ -2204,6 +2205,11 @@ class ClaudeAgentSession implements AgentSession {
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
+  /** FORK: transcript uuids this daemon's own child streamed live. The tail
+   * re-reads the same file, so an entry whose uuid is here has already been
+   * broadcast and must not be emitted a second time. Bounded: only the most
+   * recent run's worth matters. */
+  private readonly liveTranscriptUuids = new Set<string>();
   private readonly rewindTurnAnchors: ClaudeRewindTurnAnchor[] = [];
   private pendingFreshSessionId: string | null = null;
   private recentStderr = "";
@@ -2526,6 +2532,13 @@ class ClaudeAgentSession implements AgentSession {
     const modelBefore = this.lastOptionsModel;
     const blockedNotes: string[] = [];
     for (const line of content.split(/\r?\n/)) {
+      if (this.isLiveTranscriptLine(line)) {
+        // This daemon's own child wrote the entry and streamed it already; the
+        // tail is just reading it back off disk. A run's final flush can land
+        // after every settle window the tailer keeps, and re-emitting it here
+        // double-posted each reply (measured 2026-09-04).
+        continue;
+      }
       this.ingestPersistedHistoryLine(line, timeline, restoredProviderSubagentIds);
       this.captureExternalRuntimeModel(line);
       const blocked = extractBlockedPromptNote(line);
@@ -2534,8 +2547,11 @@ class ClaudeAgentSession implements AgentSession {
       }
     }
     // Lines arriving for a turn nobody reported means work is happening in the
-    // pane; open the turn before the rows go out so they carry its id.
-    this.noteExternalTurn("activity");
+    // pane; open the turn before the rows go out so they carry its id. A batch
+    // that renders nothing (our own flush, bookkeeping entries) opens no turn.
+    if (timeline.length > 0 || blockedNotes.length > 0) {
+      this.noteExternalTurn("activity");
+    }
     let emitted = 0;
     for (const entry of timeline) {
       if (entry.item.type === "user_message" && this.externalEchoes.consume(entry.item.text)) {
@@ -3379,6 +3395,19 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     this.userMessageIds.push(messageId);
+  }
+
+  private rememberLiveTranscriptUuid(uuid: string | null | undefined): void {
+    if (typeof uuid !== "string" || uuid.length === 0) {
+      return;
+    }
+    this.liveTranscriptUuids.add(uuid);
+    if (this.liveTranscriptUuids.size > LIVE_TRANSCRIPT_UUID_LIMIT) {
+      const oldest = this.liveTranscriptUuids.values().next().value;
+      if (oldest !== undefined) {
+        this.liveTranscriptUuids.delete(oldest);
+      }
+    }
   }
 
   private rememberEmittedUserMessageId(messageId: string | null | undefined): void {
@@ -4295,7 +4324,9 @@ class ClaudeAgentSession implements AgentSession {
 
     const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? null;
     const identifiers = readEventIdentifiers(message);
-    this.rememberTranscriptProgress(message, readTranscriptUuid(message));
+    const transcriptUuid = readTranscriptUuid(message);
+    this.rememberTranscriptProgress(message, transcriptUuid);
+    this.rememberLiveTranscriptUuid(transcriptUuid);
 
     this.logger.trace(
       {
@@ -5379,6 +5410,14 @@ class ClaudeAgentSession implements AgentSession {
     );
     this.historyPending = true;
     return restoredProviderSubagentIds;
+  }
+
+  private isLiveTranscriptLine(line: string): boolean {
+    if (this.liveTranscriptUuids.size === 0) {
+      return false;
+    }
+    const match = /"uuid":"([0-9a-fA-F-]{36})"/.exec(line);
+    return match !== null && this.liveTranscriptUuids.has(match[1]!);
   }
 
   private ingestPersistedHistoryLine(

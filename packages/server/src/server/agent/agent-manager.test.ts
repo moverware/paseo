@@ -1,6 +1,7 @@
 import { expect, test, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { TRANSCRIPT_TAILER_SETTLE_MS } from "./transcript-tailer.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -4632,6 +4633,10 @@ test("createAgent arms the transcript tail once thread_started reveals the sessi
       expect(manager.getAgent(snapshot.id)?.persistence?.sessionId).toBeTruthy();
     });
 
+    // The turn just completed; the tailer skips appends for a settle window
+    // after a daemon-side run (the provider's own flush). An external write
+    // is one that lands after that.
+    await new Promise((resolve) => setTimeout(resolve, TRANSCRIPT_TAILER_SETTLE_MS + 200));
     writeFileSync(transcriptPath, "");
     appendFileSync(transcriptPath, '{"type":"assistant"}\n');
     // The tail polls at its default interval; a no-op arm never delivers.

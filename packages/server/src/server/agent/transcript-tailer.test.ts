@@ -107,6 +107,43 @@ describe("TranscriptTailer", () => {
     );
   });
 
+  test("skips a flush that lands shortly after a daemon-side run settles", async () => {
+    tailer.arm("agent-1", buildSession(transcriptPath, ingested));
+
+    inFlight = true;
+    fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "daemon-run" })}\n`);
+    await vi.waitFor(
+      () => {
+        expect(tailer.observedOffset("agent-1")).toBe(fs.statSync(transcriptPath).size);
+      },
+      { timeout: 8000 },
+    );
+
+    // The run settles, then the provider flushes its final line a poll later —
+    // between the two fixed resyncs the old implementation kept.
+    inFlight = false;
+    tailer.resyncAfterRun("agent-1");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "late-flush" })}\n`);
+    await vi.waitFor(
+      () => {
+        expect(tailer.observedOffset("agent-1")).toBe(fs.statSync(transcriptPath).size);
+      },
+      { timeout: 8000 },
+    );
+    expect(ingestedTexts()).toEqual([]);
+
+    // Once the window closes, external appends stream again.
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+    fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "external" })}\n`);
+    await vi.waitFor(
+      () => {
+        expect(ingestedTexts()).toEqual(["external"]);
+      },
+      { timeout: 8000 },
+    );
+  });
+
   test("resyncs to the end on truncation instead of re-emitting from zero", async () => {
     tailer.arm("agent-1", buildSession(transcriptPath, ingested));
     fs.appendFileSync(transcriptPath, `${JSON.stringify({ text: "one" })}\n`);

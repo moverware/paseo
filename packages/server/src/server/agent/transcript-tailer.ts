@@ -3,6 +3,9 @@ import type { Logger } from "pino";
 import type { AgentSession } from "./agent-sdk-types.js";
 
 export const TRANSCRIPT_TAILER_DEFAULT_POLL_MS = 1000;
+/** How long after a daemon-side run settles its own transcript flush may still
+ * land. Lines appended in this window were already broadcast live. */
+export const TRANSCRIPT_TAILER_SETTLE_MS = 2000;
 /**
  * An external turn ends on its process's own idle report. When that report
  * never arrives — the pane was killed mid-turn, its hooks are not wired, the
@@ -40,6 +43,10 @@ interface TailedTranscript {
    * reads survives intact. */
   remainder: Buffer;
   resyncTimer: ReturnType<typeof setTimeout> | null;
+  /** Until this wall-clock time, appended lines belong to a daemon-side run
+   * that just settled (the provider flushes its transcript after the run's
+   * final event) and are skipped rather than re-emitted. */
+  settleUntil: number;
 }
 
 /**
@@ -131,6 +138,7 @@ export class TranscriptTailer {
       offset: statSize(path),
       remainder: Buffer.alloc(0),
       resyncTimer: null,
+      settleUntil: 0,
     };
     this.tailed.set(agentId, state);
     this.logger.info({ agentId, path, offset: state.offset }, "transcript tail armed");
@@ -186,10 +194,15 @@ export class TranscriptTailer {
   }
 
   /**
-   * Resync now and once more shortly after. Called when a daemon-side run
-   * settles: the provider process can flush its last transcript lines slightly
-   * after the run's final event, and those lines were already broadcast live —
-   * the delayed second resync keeps them from re-emerging through the tail.
+   * Called when a daemon-side run settles. The provider process flushes its
+   * last transcript lines slightly AFTER the run's final event, and those
+   * lines were already broadcast live, so for a settling window every append
+   * is skipped, not just whatever is on disk at two fixed instants. Two
+   * point-in-time resyncs left a gap: a flush landing between the poll that
+   * follows the first resync and the second resync was read as external work,
+   * re-emitting the final assistant message and opening a phantom external
+   * turn (measured 2026-09-04: every reply double-posted and the agent never
+   * read idle).
    */
   resyncAfterRun(agentId: string): void {
     const state = this.tailed.get(agentId);
@@ -197,13 +210,14 @@ export class TranscriptTailer {
       return;
     }
     this.resync(agentId);
+    state.settleUntil = Date.now() + TRANSCRIPT_TAILER_SETTLE_MS;
     if (state.resyncTimer) {
       clearTimeout(state.resyncTimer);
     }
     state.resyncTimer = setTimeout(() => {
       state.resyncTimer = null;
       this.resync(agentId);
-    }, 2000);
+    }, TRANSCRIPT_TAILER_SETTLE_MS);
   }
 
   dispose(): void {
@@ -225,8 +239,9 @@ export class TranscriptTailer {
     } catch {
       return;
     }
-    if (this.options.hasDaemonRun(agentId)) {
-      // The daemon's own run is writing here and broadcasting live.
+    if (this.options.hasDaemonRun(agentId) || Date.now() < state.settleUntil) {
+      // The daemon's own run is writing here and broadcasting live, or has
+      // just finished and is still flushing what it already broadcast.
       state.offset = size;
       state.remainder = Buffer.alloc(0);
       return;
