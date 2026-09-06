@@ -2414,6 +2414,15 @@ class ClaudeAgentSession implements AgentSession {
     if (this.compacting || activeTurnId !== options.expectedTurnId) {
       return { status: "unavailable" };
     }
+    // FORK: an external turn runs in the pane, not in this daemon's SDK stream.
+    // Steering it here would push the message into a daemon-side turn on the
+    // shared session while the pane is mid-turn (or mid-/compact): the daemon
+    // answers on the same session id, the pane never sees the message, and
+    // the phone shows the message twice. The manager falls through to a
+    // replacement turn, whose prompt hook routes the text into the pane.
+    if (this.autonomousTurn?.external) {
+      return { status: "unavailable" };
+    }
 
     // Capture both ends of the live SDK stream before creating or delivering the message. There
     // is deliberately no await below: a finished A cannot make this input point at a later B.

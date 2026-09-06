@@ -18,6 +18,7 @@ import type {
   AgentSessionConfig,
   AgentStreamEvent,
   ExternalTurnState,
+  SteerResult,
 } from "./agent-sdk-types.js";
 
 const logger = createTestLogger();
@@ -85,6 +86,15 @@ class ExternalTurnSession implements AgentSession {
 
   isExternalTurnActive(): boolean {
     return this.externalTurnId !== null;
+  }
+
+  steerCount = 0;
+  async steerActiveTurn(): Promise<SteerResult> {
+    if (this.externalTurnId) {
+      return { status: "unavailable" };
+    }
+    this.steerCount += 1;
+    return { status: "accepted" };
   }
 
   expectsExternalContinuation(): boolean {
@@ -337,6 +347,30 @@ describe("external turns in the agent manager", () => {
     } finally {
       unsubscribe();
     }
+  });
+
+  test("a steer-mode prompt sent mid external turn becomes a routed daemon turn, not a steer", async () => {
+    // The phone app's default send mode is steer. A steer pushes the text into
+    // this daemon's live SDK stream — but an external turn has no such stream
+    // here; the pane owns it. Steering would run the message as a daemon turn
+    // on the shared session that the pane never sees (measured 2026-09-06,
+    // during a pane /compact: the phone showed the message twice and the
+    // pane answered nothing). It must fall through to the replacement path,
+    // whose prompt hook routes the text into the pane.
+    fixture = await createFixture();
+    fixture.manager.reportExternalTurn(fixture.agentId, "running");
+    await settle();
+
+    const result = await startAgentRun(fixture.manager, fixture.agentId, "from the phone", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "steer",
+    });
+    await settle();
+
+    expect(result.disposition).toBe("turn_started");
+    expect(fixture.session.steerCount).toBe(0);
+    expect(fixture.session.startedPrompts).toEqual(["from the phone"]);
+    expect(fixture.session.interruptCount).toBe(0);
   });
 
   test("releasing an external turn frees the run slot without interrupting the pane", async () => {
