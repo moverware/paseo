@@ -48,6 +48,7 @@ import {
   type ExternalAgentIdentity,
 } from "../external-turn-command.js";
 import { ExternalEchoLedger, promptEchoText } from "../external-echo-ledger.js";
+import { persistPromptImages, withImagePathsAppendix } from "../prompt-images.js";
 import { parseCodexRolloutLine, resolveCodexRolloutPath } from "./codex/external-rollout.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
@@ -4879,7 +4880,13 @@ export class CodexAppServerAgentSession implements AgentSession {
       return null;
     }
     const text = promptEchoText(prompt).trim();
-    if (!text) {
+    // The pane can only take text, so the turn's images go to disk and ride
+    // along as paths (the same appendix the Claude route hook builds). An
+    // image-only message has no text at all; the appendix is then the prompt.
+    const agentId = this.externalAgentId ?? this.agentId;
+    const imagePaths = agentId ? persistPromptImages(agentId, prompt, this.logger) : [];
+    const delivered = withImagePathsAppendix(text, imagePaths);
+    if (!delivered) {
       return null;
     }
     // With a clientMessageId the manager commits the user's row itself;
@@ -4894,11 +4901,11 @@ export class CodexAppServerAgentSession implements AgentSession {
             item: { type: "user_message", text },
           });
         }
-        this.externalEchoes.record(text);
+        this.externalEchoes.record(delivered);
         spawnExternalTurnCommand({
           kind: "prompt",
           identity: this.externalIdentity(),
-          prompt: text,
+          prompt: delivered,
           logger: this.logger,
         });
       },

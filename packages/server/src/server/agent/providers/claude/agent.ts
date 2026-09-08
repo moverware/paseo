@@ -106,7 +106,6 @@ import {
   type AgentPermissionUpdate,
   type AgentPersistenceHandle,
   type AgentProviderNotice,
-  type AgentPromptContentBlock,
   type AgentPromptInput,
   type AgentRunOptions,
   type AgentRunResult,
@@ -138,7 +137,7 @@ import {
   spawnExternalTurnCommand,
   type ExternalAgentIdentity,
 } from "../../external-turn-command.js";
-import { resolvePaseoHome } from "../../../paseo-home.js";
+import { persistPromptImages } from "../../prompt-images.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
 import {
@@ -3790,38 +3789,13 @@ class ClaudeAgentSession implements AgentSession {
    * images otherwise exist only as base64 in memory, so a UserPromptSubmit
    * hook that routes this turn to another process has no way to hand the
    * images over — the manifest gives it fresh file paths to append to the
-   * routed prompt. Only the newest turn's files are kept; a write failure
-   * must not break the turn.
+   * routed prompt.
    */
   private persistPromptImages(prompt: AgentPromptInput): void {
-    if (!this.agentId || typeof prompt === "string") {
+    if (!this.agentId) {
       return;
     }
-    const images = prompt.filter(
-      (block): block is Extract<AgentPromptContentBlock, { type: "image" }> =>
-        typeof block === "object" && block !== null && "type" in block && block.type === "image",
-    );
-    if (images.length === 0) {
-      return;
-    }
-    try {
-      const dir = path.join(resolvePaseoHome(), "prompt-images", this.agentId);
-      fs.mkdirSync(dir, { recursive: true });
-      for (const name of fs.readdirSync(dir)) {
-        fs.rmSync(path.join(dir, name), { force: true });
-      }
-      const now = Date.now();
-      const files: string[] = [];
-      images.forEach((image, index) => {
-        const ext = image.mimeType.split("/")[1]?.split("+")[0] || "png";
-        const file = path.join(dir, `${now}-${index}.${ext}`);
-        fs.writeFileSync(file, Buffer.from(image.data, "base64"));
-        files.push(file);
-      });
-      fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ ts: now, paths: files }));
-    } catch (error) {
-      this.logger.warn({ err: error }, "Failed to persist prompt images");
-    }
+    persistPromptImages(this.agentId, prompt, this.logger);
   }
 
   private toSdkUserMessage(prompt: AgentPromptInput): SDKUserMessage {
