@@ -4906,6 +4906,7 @@ export class CodexAppServerAgentSession implements AgentSession {
           kind: "prompt",
           identity: this.externalIdentity(),
           prompt: delivered,
+          activeTurnBehavior: options?.activeTurnBehavior,
           logger: this.logger,
         });
       },

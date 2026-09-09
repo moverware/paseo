@@ -78,6 +78,19 @@ async function startOrReplaceRun(
   return { iterator, replaced };
 }
 
+/**
+ * FORK: an externally-driven session delivers the prompt to its pane and needs
+ * the sender's send mode to know whether to interrupt the pane's turn first.
+ */
+function outOfBandRunOptions(
+  options: StartAgentRunOptions | undefined,
+): AgentRunOptions | undefined {
+  if (!options?.activeTurnBehavior) {
+    return options?.runOptions;
+  }
+  return { ...options.runOptions, activeTurnBehavior: options.activeTurnBehavior };
+}
+
 export async function startAgentRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -101,7 +114,7 @@ export async function startAgentRun(
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-  if (agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
+  if (agentManager.tryRunOutOfBand(agentId, prompt, outOfBandRunOptions(options))) {
     return { disposition: "out_of_band" };
   }
   const steered = await steerOrReplaceActiveRun(agentManager, agentId, prompt, options);

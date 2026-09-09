@@ -57,7 +57,8 @@ all take the paths a daemon-run turn takes. There is no parallel status field.
   so upstream's `cancelAgentRun` reaches the pane with no manager involvement. Slash commands take
   `tryHandleOutOfBand` and spawn `daemon.externalPromptCommand`. Both are argv arrays in the daemon
   config, and both receive `PASEO_AGENT_ID`, `PASEO_AGENT_SESSION_ID`, `PASEO_AGENT_CWD` and
-  `PASEO_AGENT_LABELS` (plus `PASEO_PROMPT` for delivery). Unset means the daemon handles the
+  `PASEO_AGENT_LABELS` (plus `PASEO_PROMPT` and `PASEO_ACTIVE_TURN`, the composer's
+  interrupt/steer choice, for delivery). Unset means the daemon handles the
   request itself, as it does for any other agent.
 - A prompt arriving mid external turn does **not** interrupt from here. The external process's own
   prompt hook interrupts as part of delivering it, and a second interrupt racing that one merges

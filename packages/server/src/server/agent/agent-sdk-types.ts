@@ -212,6 +212,12 @@ export interface AgentRunOptions {
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
   clientMessageId?: string;
+  /**
+   * FORK: how the sender wants an active turn treated — the composer's
+   * interrupt/steer setting. Read by sessions whose turns run in an external
+   * process, where the daemon cannot act on the running turn itself.
+   */
+  activeTurnBehavior?: "interrupt" | "steer";
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {

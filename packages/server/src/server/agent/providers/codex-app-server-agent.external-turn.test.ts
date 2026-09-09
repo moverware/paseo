@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -241,6 +241,44 @@ describe("codex out-of-band prompt delegation", () => {
 
       const daemonOwned = createSession();
       expect(daemonOwned.tryHandleOutOfBand?.("plain prompt")).toBeNull();
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.PASEO_HOME;
+      } else {
+        process.env.PASEO_HOME = originalHome;
+      }
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("external prompt delivery env", () => {
+  test("the sender's active-turn choice rides along as PASEO_ACTIVE_TURN", async () => {
+    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
+    const out = join(home, "env.txt");
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({
+        daemon: { externalPromptCommand: ["/bin/sh", "-c", `env > "${out}"`] },
+      }),
+    );
+    const originalHome = process.env.PASEO_HOME;
+    process.env.PASEO_HOME = home;
+    try {
+      const driven = createSession();
+      driven.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
+      const handler = driven.tryHandleOutOfBand?.("stop and look", {
+        activeTurnBehavior: "interrupt",
+      });
+      expect(handler).not.toBeNull();
+      await handler?.run({ emit: () => {} });
+      const deadline = Date.now() + 5000;
+      while (!existsSync(out) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const env = readFileSync(out, "utf8");
+      expect(env).toContain("PASEO_ACTIVE_TURN=interrupt");
+      expect(env).toContain("PASEO_PROMPT=stop and look");
     } finally {
       if (originalHome === undefined) {
         delete process.env.PASEO_HOME;

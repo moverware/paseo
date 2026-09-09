@@ -85,8 +85,10 @@ export function spawnExternalTurnCommand(params: {
   identity: ExternalAgentIdentity;
   logger: Logger;
   prompt?: string;
+  /** Sender's interrupt/steer choice for a running turn, delivered as PASEO_ACTIVE_TURN. */
+  activeTurnBehavior?: "interrupt" | "steer";
 }): boolean {
-  const { kind, identity, logger, prompt } = params;
+  const { kind, identity, logger, prompt, activeTurnBehavior } = params;
   const argv = readExternalTurnCommand(kind);
   if (!argv) {
     return false;
@@ -102,6 +104,7 @@ export function spawnExternalTurnCommand(params: {
         PASEO_AGENT_LABELS: JSON.stringify(identity.labels),
         PASEO_AGENT_PROVIDER: identity.provider ?? "claude",
         ...(prompt === undefined ? {} : { PASEO_PROMPT: prompt }),
+        ...(activeTurnBehavior === undefined ? {} : { PASEO_ACTIVE_TURN: activeTurnBehavior }),
       },
       stdio: "ignore",
       detached: false,
