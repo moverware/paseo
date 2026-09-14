@@ -19,7 +19,7 @@ import { resolvePaseoHome } from "../paseo-home.js";
  * and a config key is a seam that survives an upstream merge where four
  * changed function signatures would not.
  */
-export type ExternalCommandKind = "interrupt" | "prompt";
+export type ExternalCommandKind = "interrupt" | "prompt" | "create";
 
 /**
  * Value of the `origin` label that marks an agent whose turns are run by an
@@ -30,6 +30,7 @@ export type ExternalCommandKind = "interrupt" | "prompt";
 export const EXTERNAL_ORIGIN_LABEL = "herdr";
 
 const CONFIG_KEY: Record<ExternalCommandKind, string> = {
+  create: "externalCreateCommand",
   interrupt: "externalInterruptCommand",
   prompt: "externalPromptCommand",
 };

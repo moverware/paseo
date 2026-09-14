@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { AgentSessionConfig, AgentStreamEvent } from "../agent-sdk-types.js";
@@ -216,6 +216,65 @@ describe("codex external turns", () => {
     }
   });
 
+  test("an unknown native transcript stays pending through restoration until the first prompt writes it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-pending-transcript-"));
+    const previousHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    const session = createSession();
+    try {
+      session.bindExternalSession({ sessionId: THREAD_ID, transcriptPath: "" });
+      expect(session.externalTranscriptPath()).toBeNull();
+      expect(session.externalTranscriptPending()).toBe(true);
+      await session.connect();
+      expect((await session.getRuntimeInfo()).sessionId).toBe(THREAD_ID);
+      const handle = session.describePersistence();
+      expect(handle).toMatchObject({
+        sessionId: THREAD_ID,
+        metadata: { externalTranscriptPath: "" },
+      });
+      const restored = new CodexAppServerAgentSession(
+        { provider: "codex", cwd: home, model: "gpt-5.4" },
+        handle,
+        createTestLogger(),
+        () => {
+          throw new Error("Pending native transcript must not start a daemon writer");
+        },
+        {},
+        false,
+        false,
+        false,
+        "agent-1",
+        "history",
+      );
+      try {
+        await restored.connect();
+        expect((await restored.getRuntimeInfo()).sessionId).toBe(THREAD_ID);
+        expect(restored.externalTranscriptPending()).toBe(true);
+        expect(restored.describePersistence()?.metadata.externalTranscriptPath).toBe("");
+        const history: AgentStreamEvent[] = [];
+        for await (const event of restored.streamHistory()) history.push(event);
+        expect(history).toEqual([]);
+
+        const dayDir = join(home, "sessions", "2026", "09", "14");
+        mkdirSync(dayDir, { recursive: true });
+        const rolloutPath = join(dayDir, `rollout-2026-09-14T00-00-00-${THREAD_ID}.jsonl`);
+        writeFileSync(rolloutPath, rolloutLine({ type: "task_started" }));
+        expect(restored.externalTranscriptPath()).toBe(rolloutPath);
+        expect(restored.externalTranscriptPending()).toBe(false);
+        expect(restored.describePersistence()?.metadata.externalTranscriptPath).toBe(rolloutPath);
+        expect(session.externalTranscriptPath()).toBe(rolloutPath);
+        expect(session.externalTranscriptPending()).toBe(false);
+      } finally {
+        await restored.close();
+      }
+    } finally {
+      await session.close();
+      if (previousHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("a session with no thread exposes no transcript", () => {
     const session = createSession();
     expect(session.externalTranscriptPath()).toBe(null);
@@ -223,6 +282,68 @@ describe("codex external turns", () => {
 });
 
 describe("codex out-of-band prompt delegation", () => {
+  test("binds a blank native session and delegates its initial prompt without a writer", async () => {
+    const home = mkdtempSync(join(tmpdir(), "paseo-native-codex-"));
+    const evidencePath = join(home, "prompt.txt");
+    const scriptPath = join(home, "prompt.sh");
+    const transcriptPath = join(home, "not-created-yet.jsonl");
+    writeFileSync(scriptPath, `#!/bin/sh\nprintf '%s' "$PASEO_PROMPT" > "${evidencePath}"\n`);
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({
+        daemon: { externalPromptCommand: ["/bin/sh", scriptPath] },
+      }),
+    );
+    const originalHome = process.env.PASEO_HOME;
+    process.env.PASEO_HOME = home;
+    const session = createSession();
+    try {
+      session.bindExternalSession({ sessionId: THREAD_ID, transcriptPath });
+      expect(session.id).toBe(THREAD_ID);
+      expect(session.externalTranscriptPath()).toBe(transcriptPath);
+      expect(session.describePersistence()).toMatchObject({
+        sessionId: THREAD_ID,
+        metadata: { externalTranscriptPath: transcriptPath },
+      });
+      expect((await session.getRuntimeInfo()).sessionId).toBe(THREAD_ID);
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toEqual([]);
+      session.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
+      const handler = session.tryHandleOutOfBand("compare these models");
+      expect(handler).not.toBeNull();
+      await handler?.run({ emit: () => {} });
+      await vi.waitFor(() =>
+        expect(readFileSync(evidencePath, "utf8")).toBe("compare these models"),
+      );
+      expect(session.isExternalTurnActive()).toBe(false);
+
+      const restored = new CodexAppServerAgentSession(
+        { provider: "codex", cwd: home, model: "gpt-5.4" },
+        session.describePersistence(),
+        createTestLogger(),
+        () => {
+          throw new Error("Blank native mirror must not spawn app-server");
+        },
+        {},
+        false,
+        false,
+        false,
+        "agent-1",
+        "history",
+      );
+      await restored.connect();
+      expect(restored.externalTranscriptPath()).toBe(transcriptPath);
+      expect((await restored.getRuntimeInfo()).sessionId).toBe(THREAD_ID);
+      await restored.close();
+    } finally {
+      await session.close();
+      if (originalHome === undefined) delete process.env.PASEO_HOME;
+      else process.env.PASEO_HOME = originalHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("every prompt on an externally-driven agent goes out-of-band, none otherwise", () => {
     const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
     writeFileSync(

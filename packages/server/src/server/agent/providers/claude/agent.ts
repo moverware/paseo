@@ -137,7 +137,7 @@ import {
   spawnExternalTurnCommand,
   type ExternalAgentIdentity,
 } from "../../external-turn-command.js";
-import { persistPromptImages } from "../../prompt-images.js";
+import { persistPromptImages, withImagePathsAppendix } from "../../prompt-images.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
 import {
@@ -2140,6 +2140,7 @@ class ClaudeAgentSession implements AgentSession {
   /** Human steers whose text has not reached Claude yet and therefore supersede blocking cards. */
   private readonly permissionClearingSteerUuids = new Set<string>();
   private claudeSessionId: string | null;
+  private boundExternalTranscriptPath: string | null = null;
   private persistence: AgentPersistenceHandle | null;
   private currentMode: PermissionMode;
   private planResumeMode: PermissionMode | null = null;
@@ -2236,6 +2237,9 @@ class ClaudeAgentSession implements AgentSession {
       }
       this.claudeSessionId = handle.sessionId;
       this.persistence = handle;
+      if (typeof handle.metadata?.externalTranscriptPath === "string") {
+        this.boundExternalTranscriptPath = handle.metadata.externalTranscriptPath;
+      }
       this.loadPersistedHistory(handle.sessionId);
     } else {
       this.claudeSessionId = null;
@@ -2525,6 +2529,14 @@ class ClaudeAgentSession implements AgentSession {
     yield* providerSubagentEvents;
   }
 
+  bindExternalSession(handle: { sessionId: string; transcriptPath: string }): void {
+    this.claudeSessionId = handle.sessionId;
+    this.boundExternalTranscriptPath = handle.transcriptPath;
+    this.persistence = null;
+    this.historyPending = false;
+    this.cachedRuntimeInfo = null;
+  }
+
   externalTranscriptPath(): string | null {
     if (!this.claudeSessionId) {
       return null;
@@ -2675,10 +2687,17 @@ class ClaudeAgentSession implements AgentSession {
     if (!this.isExternallyDriven()) {
       return null;
     }
-    const text = typeof prompt === "string" ? prompt.trim() : "";
-    if (!text.startsWith("/") || readExternalTurnCommand("prompt") === null) {
+    const directPrompts = this.externalLabels["herdr-direct-prompts"] === "true";
+    if (!directPrompts && typeof prompt !== "string") return null;
+    const text = promptEchoText(prompt).trim();
+    if ((!directPrompts && !text.startsWith("/")) || readExternalTurnCommand("prompt") === null) {
       return null;
     }
+    const agentId = this.externalAgentId ?? this.agentId;
+    const imagePaths =
+      directPrompts && agentId ? persistPromptImages(agentId, prompt, this.logger) : [];
+    const delivered = withImagePathsAppendix(text, imagePaths);
+    if (!delivered) return null;
     // With a clientMessageId the manager commits the user's row itself, and
     // reconciles the client's optimistic bubble against it; without one
     // (CLI, MCP, schedules) nothing has recorded the message yet.
@@ -2692,11 +2711,12 @@ class ClaudeAgentSession implements AgentSession {
             item: { type: "user_message", text },
           });
         }
-        this.externalEchoes.record(text);
+        this.externalEchoes.record(delivered);
         spawnExternalTurnCommand({
           kind: "prompt",
           identity: this.externalIdentity(),
-          prompt: text,
+          prompt: delivered,
+          activeTurnBehavior: options?.activeTurnBehavior,
           logger: this.logger,
         });
       },
@@ -3058,7 +3078,12 @@ class ClaudeAgentSession implements AgentSession {
       provider: "claude",
       sessionId: this.claudeSessionId,
       nativeHandle: this.claudeSessionId,
-      metadata: { ...this.config },
+      metadata: {
+        ...this.config,
+        ...(this.boundExternalTranscriptPath
+          ? { externalTranscriptPath: this.boundExternalTranscriptPath }
+          : {}),
+      },
     };
     return this.persistence;
   }
@@ -5464,6 +5489,9 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private resolveHistoryPath(sessionId: string): string | null {
+    if (this.boundExternalTranscriptPath && sessionId === this.claudeSessionId) {
+      return this.boundExternalTranscriptPath;
+    }
     const cwd = this.config.cwd;
     if (!cwd) return null;
     const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");

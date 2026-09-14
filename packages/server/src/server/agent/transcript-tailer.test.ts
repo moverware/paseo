@@ -51,6 +51,27 @@ describe("TranscriptTailer", () => {
     return ingested.flat();
   }
 
+  test("streams a native first turn when its transcript path appears after registration", async () => {
+    const session = buildSession(transcriptPath, ingested);
+    session.externalTranscriptPath = () => (fs.existsSync(transcriptPath) ? transcriptPath : null);
+    session.externalTranscriptPending = () => true;
+    tailer.arm("native", session);
+    fs.writeFileSync(transcriptPath, `${JSON.stringify({ text: "first reply" })}\n`);
+    await vi.waitFor(() => expect(ingestedTexts()).toEqual(["first reply"]));
+    expect(tailer.observedOffset("native")).toBe(fs.statSync(transcriptPath).size);
+  });
+
+  test("disarming a pending native session stops transcript discovery", async () => {
+    const session = buildSession(transcriptPath, ingested);
+    session.externalTranscriptPath = () => (fs.existsSync(transcriptPath) ? transcriptPath : null);
+    session.externalTranscriptPending = () => true;
+    tailer.arm("native", session);
+    tailer.disarm("native");
+    fs.writeFileSync(transcriptPath, `${JSON.stringify({ text: "closed pane" })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(ingestedTexts()).toEqual([]);
+  });
+
   test("streams whole lines appended after arm, skipping preexisting content", async () => {
     fs.writeFileSync(transcriptPath, `${JSON.stringify({ text: "old" })}\n`);
     tailer.arm("agent-1", buildSession(transcriptPath, ingested));

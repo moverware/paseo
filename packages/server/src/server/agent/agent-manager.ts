@@ -1,3 +1,4 @@
+import { externalCreationCommand, registerWithExternalPane } from "./external-create.js";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { stat } from "node:fs/promises";
@@ -261,6 +262,8 @@ type ProviderEnabledMap = Partial<Record<AgentProvider, ProviderEnabledFlag>>;
 type ProviderClientMap = Partial<Record<AgentProvider, AgentClient>>;
 
 export interface CreateAgentOptions {
+  /** Interactive client creation may delegate startup to a configured native pane launcher. */
+  externalSession?: boolean;
   labels?: Record<string, string>;
   initialPrompt?: string;
   env?: Record<string, string>;
@@ -1228,15 +1231,30 @@ export class AgentManager {
       options?.env,
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const createOptions = this.buildCreateSessionOptions(options);
+    const externalArgv = externalCreationCommand(options.externalSession, storedConfig.provider);
+    const createOptions = {
+      ...this.buildCreateSessionOptions(options),
+      ...(externalArgv ? { externalSession: true } : {}),
+    };
     const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
     await this.requireExternalMcpSupport(session, storedConfig);
-    return this.registerSession(session, storedConfig, resolvedAgentId, {
-      labels: options.labels,
-      initialTitle: options.initialTitle,
+    return registerWithExternalPane({
+      argv: externalArgv,
+      agentId: resolvedAgentId,
+      config: storedConfig,
       workspaceId: options.workspaceId,
-      owner: options.owner,
-      historyPrimed: true,
+      labels: options.labels,
+      env: options.env,
+      session,
+      register: (labels) =>
+        this.registerSession(session, storedConfig, resolvedAgentId, {
+          labels,
+          initialTitle: options.initialTitle,
+          workspaceId: options.workspaceId,
+          owner: options.owner,
+          historyPrimed: true,
+        }),
+      unregister: () => this.deleteAgentState(resolvedAgentId),
     });
   }
 

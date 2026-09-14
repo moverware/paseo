@@ -64,6 +64,7 @@ interface TailedTranscript {
  */
 export class TranscriptTailer {
   private readonly tailed = new Map<string, TailedTranscript>();
+  private readonly pending = new Map<string, ReturnType<typeof setInterval>>();
   private readonly logger: Logger;
   private readonly options: TranscriptTailerOptions;
   private readonly pollIntervalMs: number;
@@ -120,10 +121,17 @@ export class TranscriptTailer {
   /** Start (or refresh) tailing an agent's transcript. Skips content already
    * on disk: the session snapshot/import covered that. No-op for sessions
    * that do not expose a transcript. */
-  arm(agentId: string, session: AgentSession): void {
+  arm(agentId: string, session: AgentSession, fromStart = false): void {
     const path = session.externalTranscriptPath?.();
     if (!path || typeof session.ingestExternalTranscriptLines !== "function") {
       this.disarm(agentId);
+      if (session.externalTranscriptPending?.()) {
+        const timer = setInterval(() => {
+          if (session.externalTranscriptPath?.()) this.arm(agentId, session, true);
+        }, this.pollIntervalMs);
+        timer.unref?.();
+        this.pending.set(agentId, timer);
+      }
       return;
     }
     const existing = this.tailed.get(agentId);
@@ -135,7 +143,7 @@ export class TranscriptTailer {
     const state: TailedTranscript = {
       path,
       session,
-      offset: statSize(path),
+      offset: fromStart ? 0 : statSize(path),
       remainder: Buffer.alloc(0),
       resyncTimer: null,
       settleUntil: 0,
@@ -147,6 +155,7 @@ export class TranscriptTailer {
     fs.watchFile(path, { interval: this.pollIntervalMs }, () => {
       this.consume(agentId);
     });
+    if (fromStart) this.consume(agentId);
   }
 
   /** Arm only if this agent is not already tailing the session's current
@@ -172,6 +181,9 @@ export class TranscriptTailer {
   }
 
   disarm(agentId: string): void {
+    const pending = this.pending.get(agentId);
+    if (pending) clearInterval(pending);
+    this.pending.delete(agentId);
     const state = this.tailed.get(agentId);
     if (!state) {
       return;
@@ -221,6 +233,7 @@ export class TranscriptTailer {
   }
 
   dispose(): void {
+    for (const agentId of this.pending.keys()) this.disarm(agentId);
     clearInterval(this.idleSweep);
     // Deleting during Map iteration is safe per the iteration protocol.
     for (const agentId of this.tailed.keys()) {

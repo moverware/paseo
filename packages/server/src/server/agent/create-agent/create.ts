@@ -279,6 +279,7 @@ async function resolveSessionCreateAgent(
   return {
     config: sessionConfig,
     createOptions: {
+      externalSession: true,
       labels: input.labels,
       initialPrompt: trimmedPrompt,
       env: input.env,

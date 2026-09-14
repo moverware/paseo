@@ -618,6 +618,8 @@ export interface AgentLaunchContext {
 }
 
 export interface AgentCreateSessionOptions {
+  /** The native runtime is launched externally and bound before registration. */
+  externalSession?: boolean;
   /**
    * Whether the provider should leave a durable native session behind.
    * Defaults to true. Providers that cannot honor false should no-op.
@@ -672,6 +674,10 @@ export interface AgentSession {
    * turns live.
    */
   externalTranscriptPath?(): string | null;
+  /** A bound native session whose transcript location is not available yet. */
+  externalTranscriptPending?(): boolean;
+  /** Bind a newly launched native session without starting a daemon-owned turn. */
+  bindExternalSession?(handle: { sessionId: string; transcriptPath: string }): void;
   /**
    * Ingest whole transcript lines appended by an external process, converting
    * them the way streamHistory replay does and emitting them to this session's

@@ -30,16 +30,21 @@ async function createSession(): Promise<{
   session: AgentSession;
   events: AgentStreamEvent[];
   close: () => Promise<void>;
+  queryCalls: () => number;
 }> {
+  let queryCalls = 0;
   const client = new ClaudeAgentClient({
     logger: createTestLogger(),
-    queryFactory: () => createIdleQueryMock(),
+    queryFactory: () => {
+      queryCalls++;
+      return createIdleQueryMock();
+    },
     resolveBinary: async () => "/test/claude/bin",
   });
   const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
   const events: AgentStreamEvent[] = [];
   session.subscribe((event) => events.push(event));
-  return { session, events, close: () => session.close() };
+  return { session, events, close: () => session.close(), queryCalls: () => queryCalls };
 }
 
 function turnEvents(events: AgentStreamEvent[]): string[] {
@@ -418,6 +423,95 @@ describe("out-of-band slash commands for an externally-driven agent", () => {
   function markExternallyDriven(session: AgentSession): void {
     session.noteExternalIdentity?.({ agentId: "agent-7", labels: { origin: "herdr" } });
   }
+
+  test("binds a blank native session and sends its first prompt without an SDK query", async () => {
+    const { evidencePath } = configurePromptCommand();
+    const { session, close, queryCalls } = await createSession();
+    const transcriptPath = join(paseoHome!, "not-created-yet.jsonl");
+    try {
+      await session.getRuntimeInfo();
+      session.bindExternalSession?.({ sessionId: "native-session", transcriptPath });
+      session.noteExternalIdentity?.({
+        agentId: "agent-7",
+        labels: { origin: "herdr", "herdr-direct-prompts": "true" },
+      });
+      expect(session.id).toBe("native-session");
+      expect(session.externalTranscriptPath?.()).toBe(transcriptPath);
+      expect(session.describePersistence()).toMatchObject({
+        sessionId: "native-session",
+        metadata: { externalTranscriptPath: transcriptPath },
+      });
+      expect((await session.getRuntimeInfo()).sessionId).toBe("native-session");
+      const handler = session.tryHandleOutOfBand?.("compare these models");
+      expect(handler).not.toBeNull();
+      await handler?.run({ emit: () => {} });
+      await vi.waitFor(() =>
+        expect(readFileSync(evidencePath, "utf8")).toBe("compare these models"),
+      );
+      expect(queryCalls()).toBe(0);
+      expect(session.isExternalTurnActive?.()).toBe(false);
+
+      const client = new ClaudeAgentClient({
+        logger: createTestLogger(),
+        queryFactory: () => {
+          throw new Error("Mirror must not query");
+        },
+        resolveBinary: async () => "/test/claude/bin",
+      });
+      const restored = await client.resumeSession(
+        session.describePersistence()!,
+        undefined,
+        undefined,
+        { purpose: "history" },
+      );
+      expect(restored.externalTranscriptPath?.()).toBe(transcriptPath);
+      expect((await restored.getRuntimeInfo()).sessionId).toBe("native-session");
+      await restored.close();
+    } finally {
+      await close();
+    }
+  });
+
+  test("direct prompts deliver image paths and the sender's interrupt choice", async () => {
+    const { evidencePath } = configurePromptCommand();
+    const scriptPath = join(paseoHome!, "prompt.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/sh
+printf '%s' "$PASEO_PROMPT" > "${evidencePath}"
+printf '%s' "$PASEO_ACTIVE_TURN" > "${evidencePath}.behavior"
+`,
+    );
+    const { session, close, queryCalls } = await createSession();
+    try {
+      session.noteExternalIdentity?.({
+        agentId: "agent-7",
+        labels: { origin: "herdr", "herdr-direct-prompts": "true" },
+      });
+      const handler = session.tryHandleOutOfBand?.(
+        [
+          {
+            type: "image",
+            data: Buffer.from("image bytes").toString("base64"),
+            mimeType: "image/png",
+          },
+        ],
+        { activeTurnBehavior: "interrupt" },
+      );
+      expect(handler).not.toBeNull();
+      await handler?.run({ emit: () => {} });
+      await vi.waitFor(() =>
+        expect(readFileSync(`${evidencePath}.behavior`, "utf8")).toBe("interrupt"),
+      );
+      const delivered = readFileSync(evidencePath, "utf8");
+      const imagePath = delivered.split("\n").at(-1)!;
+      expect(imagePath).toContain(join(paseoHome!, "prompt-images", "agent-7"));
+      expect(readFileSync(imagePath, "utf8")).toBe("image bytes");
+      expect(queryCalls()).toBe(0);
+    } finally {
+      await close();
+    }
+  });
 
   test("returns no handler for an agent the daemon runs itself", async () => {
     configurePromptCommand();

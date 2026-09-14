@@ -55,7 +55,7 @@ import type { Logger } from "pino";
 
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { Dirent } from "node:fs";
+import { Dirent, existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -3427,6 +3427,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.resumeHandle?.sessionId) {
       this.currentThreadId = this.resumeHandle.sessionId;
       this.historyPending = true;
+      const transcriptPath = this.resumeHandle.metadata?.externalTranscriptPath;
+      if (this.initialResumePurpose === "history" && typeof transcriptPath === "string") {
+        this.boundExternalSession = true;
+        this.cachedExternalTranscriptPath = transcriptPath;
+      }
     }
   }
 
@@ -3448,6 +3453,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       throw this.createClosedError();
     }
     if (this.connected) return;
+    if (this.boundExternalSession) {
+      const transcriptPath = this.externalTranscriptPath();
+      if (!transcriptPath || !existsSync(transcriptPath)) return;
+    }
     if (this.connectionPromise) {
       await this.connectionPromise;
       if (this.closed) {
@@ -3493,9 +3502,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       await this.loadSkills();
 
       if (this.currentThreadId) {
-        await this.ensureThreadLoaded({
-          allowArchivedHistory: this.initialResumePurpose === "history",
-        });
+        if (!this.boundExternalSession) {
+          await this.ensureThreadLoaded({
+            allowArchivedHistory: this.initialResumePurpose === "history",
+          });
+        }
         await this.loadPersistedHistory();
       }
 
@@ -4403,11 +4414,9 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
     if (this.cachedRuntimeInfo) return { ...this.cachedRuntimeInfo };
-    if (!this.connected) {
-      await this.connect();
-    }
-    if (!this.currentThreadId) {
-      await this.ensureThread();
+    if (!this.boundExternalSession) {
+      if (!this.connected) await this.connect();
+      if (!this.currentThreadId) await this.ensureThread();
     }
     const info: AgentRuntimeInfo = {
       provider: CODEX_PROVIDER,
@@ -4710,6 +4719,9 @@ export class CodexAppServerAgentSession implements AgentSession {
         cwd: this.config.cwd,
         title: this.config.title ?? null,
         threadId: this.currentThreadId,
+        ...(this.boundExternalSession
+          ? { externalTranscriptPath: this.cachedExternalTranscriptPath }
+          : {}),
         modeId: this.config.modeId,
         model: this.config.model ?? null,
         thinkingOptionId,
@@ -4843,6 +4855,15 @@ export class CodexAppServerAgentSession implements AgentSession {
   private externalLabels: Record<string, string> = {};
   private readonly externalEchoes = new ExternalEchoLedger();
   private cachedExternalTranscriptPath: string | null = null;
+  private boundExternalSession = false;
+
+  bindExternalSession(handle: { sessionId: string; transcriptPath: string }): void {
+    this.currentThreadId = handle.sessionId;
+    this.cachedExternalTranscriptPath = handle.transcriptPath;
+    this.boundExternalSession = true;
+    this.historyPending = false;
+    this.cachedRuntimeInfo = null;
+  }
 
   noteExternalIdentity(identity: { agentId: string; labels: Record<string, string> }): void {
     this.externalAgentId = identity.agentId;
@@ -4850,7 +4871,11 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private isExternallyDriven(): boolean {
-    return this.externalTurnReportsSeen || this.externalLabels.origin === EXTERNAL_ORIGIN_LABEL;
+    return (
+      this.boundExternalSession ||
+      this.externalTurnReportsSeen ||
+      this.externalLabels.origin === EXTERNAL_ORIGIN_LABEL
+    );
   }
 
   /** Everything the configured external commands need to find the pane. */
@@ -4985,11 +5010,19 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!threadId) {
       return null;
     }
-    if (this.cachedExternalTranscriptPath?.includes(threadId)) {
+    if (
+      this.cachedExternalTranscriptPath &&
+      (this.boundExternalSession || this.cachedExternalTranscriptPath.includes(threadId))
+    ) {
       return this.cachedExternalTranscriptPath;
     }
-    this.cachedExternalTranscriptPath = resolveCodexRolloutPath(threadId);
-    return this.cachedExternalTranscriptPath;
+    const transcriptPath = resolveCodexRolloutPath(threadId);
+    this.cachedExternalTranscriptPath = transcriptPath ?? (this.boundExternalSession ? "" : null);
+    return transcriptPath;
+  }
+
+  externalTranscriptPending(): boolean {
+    return this.boundExternalSession && this.externalTranscriptPath() === null;
   }
 
   ingestExternalTranscriptLines(content: string): void {
@@ -7229,7 +7262,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       autoReviewEnabled,
       launchContext?.agentId,
     );
-    await session.connect();
+    if (!options?.externalSession) await session.connect();
     return session;
   }
 
