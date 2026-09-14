@@ -6,9 +6,17 @@ import { runCreateCommand } from "./create.js";
 import { runLsCommand } from "./ls.js";
 import { runRenameCommand } from "./rename.js";
 import { runUnarchiveCommand } from "./unarchive.js";
+import { runSetupCommand } from "./setup.js";
 
 export function createWorkspaceCommand(): Command {
   const workspace = new Command("workspace").description("Manage workspaces");
+
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("setup")
+      .description("Allow and run setup for a workspace")
+      .argument("<workspace-id>", "Workspace id"),
+  ).action(withOutput(runSetupCommand));
 
   addJsonAndDaemonHostOptions(
     workspace

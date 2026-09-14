@@ -177,8 +177,8 @@ stream work with no manager patches. See
 | Codex external turns                  | `codex-app-server-agent.ts` implements the same optional seams, backed by `providers/codex/external-rollout.ts`. Codex enforces one writer per thread, so mirrors (imports, origin=herdr reloads) resume for history, and ALL prompts for an externally-driven Codex agent route to the pane — a daemon turn is impossible while the pane holds the writer                                                 |
 
 Everything above lives in fork-owned modules or in optional `AgentSession`
-members the Claude and Codex providers implement. Five upstream files that the
-fork used to patch — `agent-prompt.ts`, `lifecycle-command.ts` and its test,
+members the Claude and Codex providers implement. Four upstream files that the
+fork used to patch — `lifecycle-command.ts` and its test,
 `bootstrap.ts`, `config.ts` — are byte-identical to upstream again; keep them
 that way. `agent-projections.ts` carries the live-activity title decoration
 and stays a patch until upstream grows an activity surface the official app
@@ -187,6 +187,13 @@ renders.
 The consumer of all of this is `fleet-config`'s session-handoff skill
 (hooks + the `mover_session_handoff` watcher). Behavior changes here usually
 need a matching change there.
+
+## Release branches
+
+When the user says "this goes to next", create or
+retarget the PR to `next` and preserve that destination through delivery. Follow
+[release branch discipline](docs/release.md#release-branch-discipline) for creating
+and updating `next`, integrating it after a release, and releasing a hotfix from a tag.
 
 ## Critical rules
 

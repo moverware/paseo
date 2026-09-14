@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
@@ -266,6 +266,22 @@ describe("external turns in the agent manager", () => {
   afterEach(async () => {
     await fixture?.cleanup();
     fixture = null;
+  });
+
+  test("reloading a pane mirror resumes history without requesting its writer", async () => {
+    fixture = await createFixture();
+    const resume = vi.spyOn(fixture.client, "resumeSession");
+
+    await fixture.manager.reloadAgentSession(fixture.agentId);
+
+    expect(resume).toHaveBeenCalledOnce();
+    expect(resume).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: fixture.session.sessionId }),
+      expect.any(Object),
+      expect.any(Object),
+      { purpose: "history" },
+    );
+    expect(fixture.status()).toBe("idle");
   });
 
   test("a running report marks the agent running, an idle report clears it", async () => {

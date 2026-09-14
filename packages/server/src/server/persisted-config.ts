@@ -270,6 +270,7 @@ export const PersistedConfigSchema = z
         // Argv array run to deliver a slash-command prompt to an external
         // process (prompt in PASEO_PROMPT). See AgentManagerOptions.externalPromptCommand.
         externalPromptCommand: z.array(z.string()).optional(),
+        externalCreateCommand: z.array(z.string()).min(1).optional(),
         terminalProfiles: z.array(TerminalProfileSchema).optional(),
         agentProfiles: z.array(AgentProfileSchema).optional(),
         cors: z

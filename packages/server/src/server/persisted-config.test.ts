@@ -780,3 +780,13 @@ describe.skipIf(process.platform === "win32")("persisted config file permissions
     }
   });
 });
+
+test("persists the optional native pane creation command", () => {
+  const config = PersistedConfigSchema.parse({
+    daemon: { externalCreateCommand: ["python3", "/tmp/start-pane.py"] },
+  });
+  expect(config.daemon?.externalCreateCommand).toEqual(["python3", "/tmp/start-pane.py"]);
+  expect(PersistedConfigSchema.safeParse({ daemon: { externalCreateCommand: [] } }).success).toBe(
+    false,
+  );
+});
