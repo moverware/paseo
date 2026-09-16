@@ -3927,6 +3927,80 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test("restored history includes failed-turn messages in chronological order", async () => {
+    const message = "Selected model is at capacity. Please try a different model.";
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": () => {
+        return Promise.reject(new Error("thread failed-thread already has an active writer"));
+      },
+      "thread/read": () => ({
+        thread: {
+          turns: [
+            {
+              id: "failed-turn",
+              status: "failed",
+              completedAt: 1789572842,
+              error: { message, codexErrorInfo: "serverOverloaded" },
+              items: [{ type: "agentMessage", id: "partial", text: "Checking the deployment." }],
+            },
+            {
+              id: "successful-turn",
+              status: "completed",
+              completedAt: 1789573454,
+              error: null,
+              items: [{ type: "agentMessage", id: "reply", text: "Done." }],
+            },
+          ],
+        },
+      }),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig(),
+      { sessionId: "failed-thread" },
+      createTestLogger(),
+      async () => appServer.child,
+      {},
+      false,
+      false,
+      false,
+      undefined,
+      "history",
+    );
+    try {
+      await session.connect();
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toEqual([
+        {
+          type: "timeline",
+          provider: "codex",
+          timestamp: "2026-09-16T15:34:02.000Z",
+          item: {
+            type: "assistant_message",
+            messageId: "partial",
+            text: "Checking the deployment.",
+          },
+        },
+        {
+          type: "timeline",
+          provider: "codex",
+          timestamp: "2026-09-16T15:34:02.000Z",
+          item: { type: "assistant_message", text: `[System Error] ${message}` },
+        },
+        {
+          type: "timeline",
+          provider: "codex",
+          timestamp: "2026-09-16T15:44:14.000Z",
+          item: { type: "assistant_message", messageId: "reply", text: "Done." },
+        },
+      ]);
+    } finally {
+      await session.close();
+    }
+    appServer.assertNoErrors();
+  });
+
   test("loads Codex persisted history from the app-server thread", async () => {
     const session = createSession();
     const requests: Array<{ method: string; params: unknown }> = [];

@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { AgentTimelineItem } from "../../agent-sdk-types.js";
+import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 
 /**
  * FORK: reading a Codex rollout from outside the process that writes it.
@@ -18,6 +20,7 @@ import path from "node:path";
  * - `event_msg` with `payload.type` `task_started` / `task_complete` — turn
  *   boundaries, written by the pane as the turn runs. Unlike Claude, Codex
  *   marks these explicitly, so the tail itself is an accurate turn signal.
+ *   A failed `task_complete` carries an `error` object with the displayed message.
  * - `event_msg` with `payload.type` `item_completed` — carries a full thread
  *   item in `payload.item`, in the Rust enum's PascalCase form
  *   (`UserMessage`, `AgentMessage`, `CommandExecution`, …).
@@ -32,6 +35,7 @@ import path from "node:path";
 export type CodexRolloutSignal =
   | { kind: "turn_started" }
   | { kind: "turn_completed" }
+  | { kind: "turn_failed"; error: string }
   | { kind: "item"; item: Record<string, unknown> };
 
 function codexHome(): string {
@@ -140,8 +144,10 @@ export function parseCodexRolloutLine(line: string): CodexRolloutSignal | null {
   switch (payload.type) {
     case "task_started":
       return { kind: "turn_started" };
-    case "task_complete":
-      return { kind: "turn_completed" };
+    case "task_complete": {
+      const error = readCodexTurnError(payload.error);
+      return error ? { kind: "turn_failed", error } : { kind: "turn_completed" };
+    }
     case "item_completed": {
       const item = toRecord(payload.item);
       return item ? { kind: "item", item: normalizeRolloutItem(item) } : null;
@@ -149,4 +155,30 @@ export function parseCodexRolloutLine(line: string): CodexRolloutSignal | null {
     default:
       return null;
   }
+}
+
+export function readCodexTurnError(value: unknown): string | null {
+  const error = toRecord(value);
+  if (!error) return null;
+  return typeof error.message === "string" && error.message.trim()
+    ? error.message.trim()
+    : "Codex turn failed";
+}
+
+export function codexTurnErrorHistory(
+  turn: Record<string, unknown>,
+): Array<{ item: AgentTimelineItem; timestamp: string | undefined }> {
+  const error = readCodexTurnError(turn.error);
+  if (!error) return [];
+  return [
+    {
+      item: { type: "assistant_message", text: `[System Error] ${error}` },
+      timestamp:
+        normalizeProviderReplayTimestamp(turn.completedAt) ??
+        normalizeProviderReplayTimestamp(turn.completed_at) ??
+        normalizeProviderReplayTimestamp(turn.startedAt) ??
+        normalizeProviderReplayTimestamp(turn.started_at) ??
+        undefined,
+    },
+  ];
 }

@@ -146,6 +146,44 @@ describe("codex external turns", () => {
     expect(session.isExternalTurnActive()).toBe(false);
   });
 
+  test("a capacity failure ends the external turn and remains failed after the idle hook", () => {
+    const session = createSession();
+    const events = collectEvents(session);
+    const message = "Selected model is at capacity. Please try a different model.";
+
+    session.ingestExternalTranscriptLines(
+      [
+        rolloutLine({ type: "task_started", turn_id: "failed-turn" }),
+        rolloutLine({
+          type: "task_complete",
+          turn_id: "failed-turn",
+          last_agent_message: null,
+          error: { message, codex_error_info: "server_overloaded" },
+        }),
+      ].join("\n"),
+    );
+    session.noteExternalTurn("idle");
+    session.noteExternalTurn("activity");
+
+    expect(session.isExternalTurnActive()).toBe(false);
+    expect(events).toEqual([
+      { type: "turn_started", provider: "codex" },
+      { type: "turn_failed", provider: "codex", error: message },
+    ]);
+
+    session.ingestExternalTranscriptLines(
+      [
+        rolloutLine({ type: "task_started", turn_id: "retry-turn" }),
+        rolloutLine({ type: "task_complete", turn_id: "retry-turn", error: null }),
+      ].join("\n"),
+    );
+    expect(events.slice(2)).toEqual([
+      { type: "turn_started", provider: "codex" },
+      { type: "turn_completed", provider: "codex", usage: undefined },
+    ]);
+    expect(session.isExternalTurnActive()).toBe(false);
+  });
+
   test("a recorded prompt echo is consumed instead of rendering twice", () => {
     const session = createSession();
     const events = collectEvents(session);

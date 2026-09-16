@@ -59,9 +59,12 @@ all take the paths a daemon-run turn takes. There is no parallel status field.
 - The transcript tailer (`transcript-tailer.ts`) watches the provider-owned transcript of every
   registered session and hands appended lines back to the session, which converts them and emits
   them to its subscribers like any other event. Providers opt in with `externalTranscriptPath` /
-  `ingestExternalTranscriptLines` (Claude only today). Tailing pauses while the _daemon_ is running
+  `ingestExternalTranscriptLines` (Claude and Codex). Tailing pauses while the _daemon_ is running
   the turn and resyncs when runs settle, so daemon-run turns never double-emit — an external turn is
   an in-flight run too, which is why that gate cannot key on `hasInFlightRun`.
+  Codex terminal failures arrive on `task_complete.error`, outside its message items. They use the
+  ordinary turn-failure path so the official app displays the error and settles the run. A reload
+  with `rehydrateFromDisk` recovers previously omitted errors from provider history.
 - `AgentSession.noteExternalTurn(state)` opens and closes that turn. `running` / `idle` come from
   the external process's lifecycle hooks via `update_agent_request.externalTurn`
   (`paseo agent update --external-turn running|idle`); `activity` is inferred from tailed lines and

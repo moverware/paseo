@@ -49,7 +49,11 @@ import {
 } from "../external-turn-command.js";
 import { ExternalEchoLedger, promptEchoText } from "../external-echo-ledger.js";
 import { persistPromptImages, withImagePathsAppendix } from "../prompt-images.js";
-import { parseCodexRolloutLine, resolveCodexRolloutPath } from "./codex/external-rollout.js";
+import {
+  parseCodexRolloutLine,
+  codexTurnErrorHistory,
+  resolveCodexRolloutPath,
+} from "./codex/external-rollout.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
 
@@ -2033,6 +2037,7 @@ async function loadCodexThreadHistoryTimeline(params: {
         }
       }
     }
+    timeline.push(...codexTurnErrorHistory(turn));
   }
   const subAgentRoutes = Array.from(subAgentTimelineIndexByThreadId.entries()).flatMap(
     ([childThreadId, timelineIndex]): PersistedSubAgentRoute[] => {
@@ -5105,6 +5110,14 @@ export class CodexAppServerAgentSession implements AgentSession {
           break;
         case "turn_completed":
           this.noteExternalTurn("idle");
+          break;
+        case "turn_failed":
+          this.noteExternalTurn("superseded");
+          this.notifySubscribers({
+            type: "turn_failed",
+            provider: CODEX_PROVIDER,
+            error: signal.error,
+          });
           break;
         case "item": {
           const entries = threadItemToTimelineEntries(signal.item, {
