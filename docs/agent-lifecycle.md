@@ -82,6 +82,17 @@ all take the paths a daemon-run turn takes. There is no parallel status field.
 - A prompt arriving mid external turn does **not** interrupt from here. The external process's own
   prompt hook interrupts as part of delivering it, and a second interrupt racing that one merges
   both prompts in its composer; `replaceAgentRun` releases the turn instead.
+- A native conversation can outlive its session id. Claude Code parks a live interactive session
+  into a background worker under a new id (its in-place update relaunch does this); the old
+  transcript ends with a `continued-in` row naming the successor and never grows again. The Claude
+  session follows that row when it arrives on the tail and, on resume, walks the chain on disk
+  (`providers/claude/continuation.ts`, `AgentSession.followContinuationsOnDisk`), emitting
+  `thread_started` so the manager re-persists the id and the tailer re-arms on the new path.
+  Nothing is replayed: the successor's copied history is already on the timeline. Such a session is
+  owned by its worker, so a daemon resume is refused; the deployment labels the agent
+  `herdr-direct-prompts=true` and every prompt goes through the external prompt command. When
+  that command exits non-zero the prompt did not arrive, and the session posts
+  `EXTERNAL_DELIVERY_FAILED` to the timeline so the sender sees it.
 
 ### Cancellation
 

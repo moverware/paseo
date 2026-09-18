@@ -29,6 +29,15 @@ export type ExternalCommandKind = "interrupt" | "prompt" | "create";
  */
 export const EXTERNAL_ORIGIN_LABEL = "herdr";
 
+/**
+ * Timeline text for a prompt the external command could not deliver: nothing
+ * reached the pane, so the message is not in the conversation and the sender
+ * should send it again once the pane is reachable.
+ */
+export const EXTERNAL_DELIVERY_FAILED =
+  "[System Error] This message did not reach the terminal session that runs this " +
+  "conversation. Check that its pane is open and send it again.";
+
 const CONFIG_KEY: Record<ExternalCommandKind, string> = {
   create: "externalCreateCommand",
   interrupt: "externalInterruptCommand",
@@ -88,8 +97,11 @@ export function spawnExternalTurnCommand(params: {
   prompt?: string;
   /** Sender's interrupt/steer choice for a running turn, delivered as PASEO_ACTIVE_TURN. */
   activeTurnBehavior?: "interrupt" | "steer";
+  /** Called when the command exits non-zero: the external process was not
+   * reached, so whatever was sent to it did not arrive. */
+  onFailure?: (code: number | null) => void;
 }): boolean {
-  const { kind, identity, logger, prompt, activeTurnBehavior } = params;
+  const { kind, identity, logger, prompt, activeTurnBehavior, onFailure } = params;
   const argv = readExternalTurnCommand(kind);
   if (!argv) {
     return false;
@@ -116,6 +128,7 @@ export function spawnExternalTurnCommand(params: {
     child.on("exit", (code) => {
       if (code !== 0) {
         logger.warn({ kind, agentId: identity.agentId, code }, "external command exited non-zero");
+        onFailure?.(code);
       }
     });
   } catch (error) {

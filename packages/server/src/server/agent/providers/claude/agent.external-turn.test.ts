@@ -51,6 +51,12 @@ function turnEvents(events: AgentStreamEvent[]): string[] {
   return events.map((event) => event.type).filter((type) => type.startsWith("turn_"));
 }
 
+function timelineNotes(events: AgentStreamEvent[]): string[] {
+  return events.flatMap((event) =>
+    event.type === "timeline" && "text" in event.item ? [event.item.text] : [],
+  );
+}
+
 describe("external turns drive the session's autonomous turn", () => {
   test("a running report opens a turn and an idle report completes it", async () => {
     const { session, events, close } = await createSession();
@@ -246,6 +252,27 @@ describe("ingesting transcript lines an external process wrote", () => {
       );
       expect(turnIds.size).toBe(1);
       expect([...turnIds][0]).toBeDefined();
+    } finally {
+      await close();
+    }
+  });
+
+  test("follows a continued-in row to the successor session instead of rendering it", async () => {
+    const { session, events, close } = await createSession();
+    try {
+      const before = (await session.getRuntimeInfo()).sessionId;
+      session.ingestExternalTranscriptLines?.(
+        `${userLine("keep going", "u1")}\n` +
+          `${JSON.stringify({ type: "continued-in", continuedInSessionId: "successor-1" })}\n`,
+      );
+      expect(timelineTexts(events)).toEqual(["keep going"]);
+      const threadStarted = events.filter((event) => event.type === "thread_started");
+      expect(threadStarted).toHaveLength(1);
+      expect(session.id).toBe("successor-1");
+      expect(session.id).not.toBe(before);
+      expect(session.describePersistence()).toMatchObject({ sessionId: "successor-1" });
+      expect((await session.getRuntimeInfo()).sessionId).toBe("successor-1");
+      expect(session.externalTranscriptPath?.()).toContain("successor-1.jsonl");
     } finally {
       await close();
     }
@@ -467,6 +494,31 @@ describe("out-of-band slash commands for an externally-driven agent", () => {
       expect(restored.externalTranscriptPath?.()).toBe(transcriptPath);
       expect((await restored.getRuntimeInfo()).sessionId).toBe("native-session");
       await restored.close();
+    } finally {
+      await close();
+    }
+  });
+
+  test("a delivery command that exits non-zero leaves a note where the sender is looking", async () => {
+    paseoHome = mkdtempSync(join(tmpdir(), "external-prompt-fail-"));
+    writeFileSync(
+      join(paseoHome, "config.json"),
+      JSON.stringify({ daemon: { externalPromptCommand: ["/usr/bin/false"] } }),
+    );
+    process.env.PASEO_HOME = paseoHome;
+    const { session, close } = await createSession();
+    const emitted: AgentStreamEvent[] = [];
+    try {
+      session.noteExternalIdentity?.({
+        agentId: "agent-7",
+        labels: { origin: "herdr", "herdr-direct-prompts": "true" },
+      });
+      const handler = session.tryHandleOutOfBand?.("hello pane");
+      expect(handler).not.toBeNull();
+      await handler?.run({ emit: (event) => emitted.push(event) });
+      await vi.waitFor(() => {
+        expect(timelineNotes(emitted).at(-1)).toContain("did not reach the terminal session");
+      });
     } finally {
       await close();
     }

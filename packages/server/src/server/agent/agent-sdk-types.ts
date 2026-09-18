@@ -703,6 +703,14 @@ export interface AgentSession {
   /** Bind a newly launched native session without starting a daemon-owned turn. */
   bindExternalSession?(handle: { sessionId: string; transcriptPath: string }): void;
   /**
+   * A native conversation can be moved by its CLI into a successor session
+   * (Claude Code parks an interactive session into a background worker on
+   * relaunch; the old transcript ends with a pointer to the new one). Follow
+   * that chain on disk to the live end. Returns true when the session id
+   * changed, so the caller re-persists it and re-arms the transcript tail.
+   */
+  followContinuationsOnDisk?(): boolean;
+  /**
    * Ingest whole transcript lines appended by an external process, converting
    * them the way streamHistory replay does and emitting them to this session's
    * subscribers. Going out as ordinary stream events is what gives an external

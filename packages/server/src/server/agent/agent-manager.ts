@@ -961,6 +961,12 @@ export class AgentManager {
    * the terminal pane running it.
    */
   private armExternalSession(agent: ActiveManagedAgent): void {
+    if (agent.session.followContinuationsOnDisk?.()) {
+      // The persisted id pointed at a transcript that has since been
+      // continued elsewhere; the session now holds the live end.
+      this.refreshSessionPersistence(agent);
+      this.emitState(agent);
+    }
     this.transcriptTailer.arm(agent.id, agent.session);
     agent.session.noteExternalIdentity?.({ agentId: agent.id, labels: agent.labels });
   }
@@ -4457,7 +4463,9 @@ export class AgentManager {
     if (handle) {
       agent.persistence = attachPersistenceCwd(handle, agent.cwd);
     }
-    // The provider session id can become available after registration.
+    // The provider session id can become available after registration, and a
+    // continued conversation moves to a new transcript: ensureArmed re-arms
+    // on the current path when it differs from the one being tailed.
     this.transcriptTailer.ensureArmed(agent.id, agent.session);
   }
 

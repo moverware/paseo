@@ -42,6 +42,7 @@ import {
 import { importSessionFromPersistence } from "../provider-session-import.js";
 // FORK: external-turn support for Codex TUI panes (see the fork notes in CLAUDE.md).
 import {
+  EXTERNAL_DELIVERY_FAILED,
   EXTERNAL_ORIGIN_LABEL,
   readExternalTurnCommand,
   spawnExternalTurnCommand,
@@ -5006,6 +5007,13 @@ export class CodexAppServerAgentSession implements AgentSession {
           prompt: delivered,
           activeTurnBehavior: options?.activeTurnBehavior,
           logger: this.logger,
+          onFailure: () => {
+            emit({
+              type: "timeline",
+              provider: CODEX_PROVIDER,
+              item: { type: "assistant_message", text: EXTERNAL_DELIVERY_FAILED },
+            });
+          },
         });
       },
     };

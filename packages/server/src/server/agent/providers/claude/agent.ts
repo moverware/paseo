@@ -80,6 +80,7 @@ import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
 import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
+import { readClaudeContinuation } from "./continuation.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
 import {
@@ -132,6 +133,7 @@ import {
 import { extractBlockedPromptNote } from "./blocked-prompt-note.js";
 import { ExternalEchoLedger, promptEchoText } from "../../external-echo-ledger.js";
 import {
+  EXTERNAL_DELIVERY_FAILED,
   EXTERNAL_ORIGIN_LABEL,
   readExternalTurnCommand,
   spawnExternalTurnCommand,
@@ -2549,6 +2551,98 @@ class ClaudeAgentSession implements AgentSession {
     this.cachedRuntimeInfo = null;
   }
 
+  /**
+   * Claude Code can move a live conversation out of the process a mirror
+   * follows — an interactive terminal session parked into a background worker
+   * on relaunch is the common case. The conversation continues under a NEW
+   * session id: the old transcript ends with a `continued-in` row naming the
+   * successor and never grows again, while the successor's transcript opens
+   * with a copy of the history and then carries every later turn. Following
+   * the row keeps this agent on the conversation instead of on a dead file
+   * (2026-09-18: a pane's Stop hook imported the successor as a second agent,
+   * and a prompt sent to it was resumed daemon-side against a session its
+   * background worker owned, which Claude Code refuses).
+   *
+   * Only the id and transcript binding move. The copied history is already on
+   * this timeline, so nothing is replayed; `thread_started` lets the manager
+   * re-persist the new id and re-arm the tailer on the new path.
+   */
+  private followContinuation(content: string): boolean {
+    const lines = content.split(/\r?\n/);
+    for (const [index, line] of lines.entries()) {
+      if (!line.includes('"continued-in"')) {
+        continue;
+      }
+      let successor: string | null = null;
+      try {
+        const parsed = JSON.parse(line) as { type?: unknown; continuedInSessionId?: unknown };
+        if (parsed.type === "continued-in" && typeof parsed.continuedInSessionId === "string") {
+          successor = parsed.continuedInSessionId;
+        }
+      } catch {
+        // not a whole row
+      }
+      if (!successor || successor === this.claudeSessionId) {
+        continue;
+      }
+      // Rows before the pointer are the old transcript's last turn lines and
+      // render as usual; the pointer itself is the last row that file gets.
+      const before = lines.slice(0, index).join("\n");
+      if (before.trim()) {
+        this.ingestExternalTranscriptLines(before);
+      }
+      this.adoptContinuation(successor);
+      return true;
+    }
+    return false;
+  }
+
+  /** Bind this session to the successor of a continued conversation. */
+  private adoptContinuation(successor: string): void {
+    const previous = this.claudeSessionId;
+    this.logger.info(
+      { previousSessionId: previous, sessionId: successor },
+      "Claude conversation continued in another session; following it",
+    );
+    this.claudeSessionId = successor;
+    this.boundExternalTranscriptPath = null;
+    this.persistence = null;
+    this.cachedRuntimeInfo = null;
+    this.queryRestartNeeded = true;
+    this.notifySubscribers({ type: "thread_started", provider: "claude", sessionId: successor });
+  }
+
+  /**
+   * On resume, a mirror bound to a transcript that has since been continued
+   * follows the chain to the live end before anything is armed on it. Returns
+   * true when the id changed.
+   */
+  followContinuationsOnDisk(): boolean {
+    const start = this.claudeSessionId;
+    if (!start) {
+      return false;
+    }
+    let current = start;
+    const seen = new Set<string>([current]);
+    for (let hop = 0; hop < 8; hop += 1) {
+      const transcriptPath = this.resolveHistoryPath(current);
+      if (!transcriptPath) {
+        break;
+      }
+      const next = readClaudeContinuation(transcriptPath);
+      if (!next || seen.has(next)) {
+        break;
+      }
+      seen.add(next);
+      current = next;
+    }
+    if (current === start) {
+      return false;
+    }
+    this.adoptContinuation(current);
+    return true;
+  }
+
   externalTranscriptPath(): string | null {
     if (!this.claudeSessionId) {
       return null;
@@ -2557,6 +2651,11 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   ingestExternalTranscriptLines(content: string): void {
+    if (content.includes('"continued-in"') && this.followContinuation(content)) {
+      // The rest of this batch belongs to the transcript that just ended; the
+      // successor's transcript is what the conversation is in now.
+      return;
+    }
     const timeline: PersistedTimelineEntry[] = [];
     // No restored-subagent set on the live tail: sidechain entries are skipped
     // by the ingest itself, and the subagents track is rebuilt on replay.
@@ -2730,6 +2829,16 @@ class ClaudeAgentSession implements AgentSession {
           prompt: delivered,
           activeTurnBehavior: options?.activeTurnBehavior,
           logger: this.logger,
+          onFailure: () => {
+            // The pane was not reached, so the message is not in the
+            // conversation. Say so where the sender is looking; a silent
+            // spinner over a lost message reads as the agent ignoring them.
+            emit({
+              type: "timeline",
+              provider: "claude",
+              item: { type: "assistant_message", text: EXTERNAL_DELIVERY_FAILED },
+            });
+          },
         });
       },
     };
