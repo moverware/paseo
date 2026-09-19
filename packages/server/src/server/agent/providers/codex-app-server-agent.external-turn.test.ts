@@ -206,6 +206,96 @@ describe("codex external turns", () => {
     expect(timeline).toEqual([]);
   });
 
+  test("a question the pane parked in its drawer becomes a question card", () => {
+    const session = createSession();
+    const events = collectEvents(session);
+    session.ingestExternalTranscriptLines(
+      `${rolloutLine({
+        type: "item_completed",
+        thread_id: THREAD_ID,
+        turn_id: "t1",
+        item: {
+          type: "AgentMessage",
+          id: "call_q1",
+          phase: "final_answer",
+          delivery: "async",
+          content: [{ type: "Text", text: "Which tab should swipe-back apply to?" }],
+          questions: [
+            { title: "Which tab should swipe-back apply to?", options: ["Outfits", "Closet"] },
+          ],
+        },
+      })}\n`,
+    );
+    const requested = events.find((event) => event.type === "permission_requested");
+    expect(requested).toBeDefined();
+    expect(requested?.type === "permission_requested" && requested.request).toMatchObject({
+      id: "permission-call_q1",
+      kind: "question",
+      name: "request_user_input_async",
+    });
+    expect(session.getPendingPermissions().map((request) => request.id)).toEqual([
+      "permission-call_q1",
+    ]);
+    const timeline = events.filter((event) => event.type === "timeline");
+    expect(timeline.at(-1)?.type === "timeline" && timeline.at(-1)?.item).toMatchObject({
+      type: "tool_call",
+      name: "request_user_input_async",
+    });
+  });
+
+  test("answering a pane question types the answer into the drawer instead of steering", async () => {
+    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
+    const out = join(home, "env.txt");
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({
+        daemon: { externalPromptCommand: ["/bin/sh", "-c", `env > "${out}"`] },
+      }),
+    );
+    const originalHome = process.env.PASEO_HOME;
+    process.env.PASEO_HOME = home;
+    try {
+      const session = createSession();
+      session.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
+      const events = collectEvents(session);
+      session.ingestExternalTranscriptLines(
+        `${rolloutLine({
+          type: "item_completed",
+          thread_id: THREAD_ID,
+          turn_id: "t1",
+          item: {
+            type: "AgentMessage",
+            id: "call_q2",
+            delivery: "async",
+            content: [{ type: "Text", text: "Unlock the console?" }],
+            questions: [{ title: "Unlock the console?", options: null }],
+          },
+        })}\n`,
+      );
+      const result = await session.respondToPermission("permission-call_q2", {
+        behavior: "allow",
+        updatedInput: { answers: { "Question 1": "Done, it is unlocked" } },
+      });
+      expect(result).toBeUndefined();
+      const deadline = Date.now() + 5000;
+      while (!existsSync(out) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const env = readFileSync(out, "utf8");
+      expect(env).toContain("PASEO_QUESTION=answer");
+      expect(env).toContain("Done, it is unlocked");
+      expect(events.some((event) => event.type === "permission_resolved")).toBe(true);
+      expect(session.getPendingPermissions()).toEqual([]);
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.PASEO_HOME;
+      } else {
+        process.env.PASEO_HOME = originalHome;
+      }
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("non-signal rollout lines are ignored", () => {
     const session = createSession();
     const events = collectEvents(session);

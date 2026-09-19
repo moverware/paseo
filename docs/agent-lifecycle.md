@@ -93,6 +93,16 @@ all take the paths a daemon-run turn takes. There is no parallel status field.
   `herdr-direct-prompts=true` and every prompt goes through the external prompt command. When
   that command exits non-zero the prompt did not arrive, and the session posts
   `EXTERNAL_DELIVERY_FAILED` to the timeline so the sender sees it.
+- A question Codex asks mid-turn (`request_user_input_async`) reaches a pane mirror through the
+  rollout as a completed `AgentMessage` with `questions`, while the pane parks it in its queued
+  inputs drawer. The mirror hands it to `CodexAsyncQuestions`, so the client gets the same question
+  card a daemon-run session raises. Answering or dismissing an externally driven agent's question
+  spawns the external prompt command with `PASEO_QUESTION=answer|dismiss` (and the answer text as
+  `PASEO_PROMPT`) instead of steering, because the pane's writer lock refuses a daemon turn. The
+  command exits `EXTERNAL_QUESTION_GONE_EXIT_CODE` when the pane no longer holds the question, and
+  the session posts `EXTERNAL_QUESTION_ALREADY_RESOLVED`. The rollout records nothing when a
+  question is handled at the desk, so the deployment's watcher denies cards whose pane is no
+  longer blocked.
 
 ### Cancellation
 

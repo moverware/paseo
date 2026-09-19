@@ -38,6 +38,14 @@ export const EXTERNAL_DELIVERY_FAILED =
   "[System Error] This message did not reach the terminal session that runs this " +
   "conversation. Check that its pane is open and send it again.";
 
+/** Exit code the external prompt command returns when asked to answer a
+ * question the terminal pane is no longer holding: it was answered or
+ * skipped there, so the client's copy of the question is stale. */
+export const EXTERNAL_QUESTION_GONE_EXIT_CODE = 3;
+
+export const EXTERNAL_QUESTION_ALREADY_RESOLVED =
+  "This question was already answered or skipped in the terminal pane.";
+
 const CONFIG_KEY: Record<ExternalCommandKind, string> = {
   create: "externalCreateCommand",
   interrupt: "externalInterruptCommand",
@@ -100,8 +108,12 @@ export function spawnExternalTurnCommand(params: {
   /** Called when the command exits non-zero: the external process was not
    * reached, so whatever was sent to it did not arrive. */
   onFailure?: (code: number | null) => void;
+  /** The prompt answers ("answer") or dismisses ("dismiss") a question the
+   * external process is holding open, rather than starting a new turn.
+   * Delivered as PASEO_QUESTION. */
+  question?: "answer" | "dismiss";
 }): boolean {
-  const { kind, identity, logger, prompt, activeTurnBehavior, onFailure } = params;
+  const { kind, identity, logger, prompt, activeTurnBehavior, onFailure, question } = params;
   const argv = readExternalTurnCommand(kind);
   if (!argv) {
     return false;
@@ -118,6 +130,7 @@ export function spawnExternalTurnCommand(params: {
         PASEO_AGENT_PROVIDER: identity.provider ?? "claude",
         ...(prompt === undefined ? {} : { PASEO_PROMPT: prompt }),
         ...(activeTurnBehavior === undefined ? {} : { PASEO_ACTIVE_TURN: activeTurnBehavior }),
+        ...(question === undefined ? {} : { PASEO_QUESTION: question }),
       },
       stdio: "ignore",
       detached: false,

@@ -44,6 +44,8 @@ import { importSessionFromPersistence } from "../provider-session-import.js";
 import {
   EXTERNAL_DELIVERY_FAILED,
   EXTERNAL_ORIGIN_LABEL,
+  EXTERNAL_QUESTION_ALREADY_RESOLVED,
+  EXTERNAL_QUESTION_GONE_EXIT_CODE,
   readExternalTurnCommand,
   spawnExternalTurnCommand,
   type ExternalAgentIdentity,
@@ -1947,6 +1949,12 @@ function mcpToolResultImagesToTimeline(item: unknown): AgentTimelineItem[] {
       }),
     )
     .filter((timelineItem): timelineItem is AgentTimelineItem => timelineItem !== null);
+}
+
+/** Rollout items spell the type `AgentMessage`; the async-question schema
+ * and the timeline mapper read the app-server spelling. */
+function normalizeCodexRolloutAgentMessage(item: Record<string, unknown>): Record<string, unknown> {
+  return item.type === "AgentMessage" ? { ...item, type: "agentMessage" } : item;
 }
 
 function threadItemToTimelineEntries(
@@ -4641,6 +4649,43 @@ export class CodexAppServerAgentSession implements AgentSession {
   ): Promise<AgentPermissionResult | void> {
     const prepared = this.asyncQuestions.prepareResponse(requestId, response);
     let followUpPrompt = prepared.prompt;
+    if (this.isExternallyDriven() && readExternalTurnCommand("prompt") !== null) {
+      // The pane holds the question in its queued-inputs drawer, so the
+      // answer is typed there rather than steered into a daemon turn the
+      // pane's writer lock would refuse. A dismiss skips the drawer entry.
+      const questionText = prepared.prompt;
+      if (questionText) {
+        this.externalEchoes.record(questionText);
+      }
+      spawnExternalTurnCommand({
+        kind: "prompt",
+        identity: this.externalIdentity(),
+        prompt: questionText,
+        question: questionText ? "answer" : "dismiss",
+        logger: this.logger,
+        onFailure: (code) => {
+          this.emitEvent({
+            type: "timeline",
+            provider: CODEX_PROVIDER,
+            item: {
+              type: "assistant_message",
+              text:
+                code === EXTERNAL_QUESTION_GONE_EXIT_CODE
+                  ? EXTERNAL_QUESTION_ALREADY_RESOLVED
+                  : EXTERNAL_DELIVERY_FAILED,
+            },
+          });
+        },
+      });
+      this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: prepared.complete() });
+      this.emitEvent({
+        type: "permission_resolved",
+        provider: CODEX_PROVIDER,
+        requestId,
+        resolution: response,
+      });
+      return;
+    }
     const expectedTurnId = this.activeForegroundTurnId;
     if (prepared.prompt && expectedTurnId) {
       const result = await this.steerActiveTurn(prepared.prompt, {
@@ -5128,7 +5173,22 @@ export class CodexAppServerAgentSession implements AgentSession {
           });
           break;
         case "item": {
-          const entries = threadItemToTimelineEntries(signal.item, {
+          // A question the model asked mid-turn (request_user_input_async)
+          // is a completed AgentMessage carrying `questions`; the pane parks
+          // it in its queued-inputs drawer. Raise it as the same question
+          // card a daemon-run session gets, keyed by the item id, so the
+          // client can answer or dismiss it instead of only seeing the
+          // pane's "Action Required" title.
+          const rolloutItem = normalizeCodexRolloutAgentMessage(signal.item);
+          const request = this.asyncQuestions.receive(rolloutItem);
+          if (request) {
+            this.notifySubscribers({
+              type: "permission_requested",
+              provider: CODEX_PROVIDER,
+              request,
+            });
+          }
+          const entries = threadItemToTimelineEntries(rolloutItem, {
             cwd: this.config.cwd ?? null,
           });
           if (entries.length === 0) {
