@@ -55,6 +55,7 @@ test("loads archived records for history and active records with the interactive
 
   const archivedId = "00000000-0000-4000-8000-000000000301";
   const activeId = "00000000-0000-4000-8000-000000000302";
+  const mirrorId = "00000000-0000-4000-8000-000000000303";
 
   try {
     const archived = await manager.createAgent({ provider: "codex", cwd: root }, archivedId, {
@@ -67,14 +68,27 @@ test("loads archived records for history and active records with the interactive
     });
     await manager.closeAgent(active.id);
 
+    // FORK: a live pane mirror loads for history — the pane holds the writer.
+    const mirror = await manager.createAgent({ provider: "codex", cwd: root }, mirrorId, {
+      workspaceId: "workspace-mirror",
+      labels: { origin: "herdr" },
+    });
+    await manager.closeAgent(mirror.id);
+
     await ensureAgentLoaded(archived.id, { agentManager: manager, agentStorage: storage, logger });
     await ensureAgentLoaded(active.id, { agentManager: manager, agentStorage: storage, logger });
+    await ensureAgentLoaded(mirror.id, { agentManager: manager, agentStorage: storage, logger });
 
-    expect(resumeOptions).toEqual([{ purpose: "history" }, { purpose: "interactive" }]);
+    expect(resumeOptions).toEqual([
+      { purpose: "history" },
+      { purpose: "interactive" },
+      { purpose: "history" },
+    ]);
   } finally {
     await Promise.all([
       manager.closeAgent(archivedId).catch(() => undefined),
       manager.closeAgent(activeId).catch(() => undefined),
+      manager.closeAgent(mirrorId).catch(() => undefined),
     ]);
     await manager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);

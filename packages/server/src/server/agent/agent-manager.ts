@@ -1457,10 +1457,14 @@ export class AgentManager {
     // have read the record before a queued archive or restore completed. Residency is
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
+    // FORK: a caller's history purpose is kept — an externally-driven mirror
+    // (origin=herdr) is live yet must never be resumed interactively, because
+    // the pane holds the provider's writer and Codex refuses a second one.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
-    const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
-      : resumeOptions;
+    const currentResumeOptions =
+      record && resumeOptions?.purpose !== "history"
+        ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+        : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
