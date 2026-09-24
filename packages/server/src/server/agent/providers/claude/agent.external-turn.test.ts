@@ -684,3 +684,70 @@ describe("external turn recovery after a missed report", () => {
     }
   });
 });
+
+describe("a pane compacting its context", () => {
+  function compactBoundaryLine(uuid: string): string {
+    return JSON.stringify({
+      type: "system",
+      subtype: "compact_boundary",
+      uuid,
+      content: "Conversation compacted",
+      compactMetadata: { trigger: "auto", preTokens: 800_000, postTokens: 11_000 },
+    });
+  }
+
+  function compactionMarkers(events: AgentStreamEvent[]): string[] {
+    return events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "compaction" ? [event.item.status] : [],
+    );
+  }
+
+  test("a compacting report opens the turn and posts one loading marker", async () => {
+    const { session, events, close } = await createSession();
+    try {
+      session.noteExternalTurn?.("compacting");
+      // Claude Code repeats hook-driven reports; the marker must not.
+      session.noteExternalTurn?.("compacting");
+      expect(turnEvents(events)).toEqual(["turn_started"]);
+      expect(compactionMarkers(events)).toEqual(["loading"]);
+      expect(session.isExternalTurnActive?.()).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  test("the tailed compact boundary completes the marker and a later compaction opens a new one", async () => {
+    const { session, events, close } = await createSession();
+    try {
+      session.noteExternalTurn?.("running");
+      session.noteExternalTurn?.("compacting");
+      session.ingestExternalTranscriptLines?.(`${compactBoundaryLine("c1")}\n`);
+      expect(compactionMarkers(events)).toEqual(["loading", "completed"]);
+      const completed = events.find(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "compaction" &&
+          event.item.status === "completed",
+      );
+      expect(completed).toMatchObject({ item: { trigger: "auto", preTokens: 800_000 } });
+
+      session.noteExternalTurn?.("compacting");
+      expect(compactionMarkers(events)).toEqual(["loading", "completed", "loading"]);
+    } finally {
+      await close();
+    }
+  });
+
+  test("the marker closes with the turn, so the next turn's compaction is not swallowed", async () => {
+    const { session, events, close } = await createSession();
+    try {
+      session.noteExternalTurn?.("compacting");
+      session.noteExternalTurn?.("idle");
+      session.noteExternalTurn?.("compacting");
+      expect(turnEvents(events)).toEqual(["turn_started", "turn_completed", "turn_started"]);
+      expect(compactionMarkers(events)).toEqual(["loading", "loading"]);
+    } finally {
+      await close();
+    }
+  });
+});

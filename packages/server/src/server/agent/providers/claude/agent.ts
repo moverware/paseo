@@ -2688,6 +2688,10 @@ class ClaudeAgentSession implements AgentSession {
       if (entry.item.type === "user_message" && this.externalEchoes.consume(entry.item.text)) {
         continue;
       }
+      if (entry.item.type === "compaction" && entry.item.status === "completed") {
+        // Closes the "Compacting…" marker a compacting report opened.
+        this.compactionMarkerOpen = false;
+      }
       emitted += 1;
       this.notifySubscribers({ type: "timeline", provider: "claude", item: entry.item });
     }
@@ -2730,6 +2734,24 @@ class ClaudeAgentSession implements AgentSession {
    * somewhere else.
    */
   noteExternalTurn(state: ExternalTurnState): void {
+    if (state === "compacting") {
+      // The pane's PreCompact hook. Compaction is a model call that writes
+      // nothing to the transcript until its boundary row lands, so without
+      // this the phone shows a bare spinner for minutes. Open the turn as a
+      // running report would, then post the same marker a daemon-run
+      // compaction opens; the tailed compact_boundary row completes it.
+      this.noteExternalTurn("running");
+      if (!this.autonomousTurn?.external || this.compactionMarkerOpen) {
+        return;
+      }
+      this.compactionMarkerOpen = true;
+      this.notifySubscribers({
+        type: "timeline",
+        provider: "claude",
+        item: { type: "compaction", status: "loading" },
+      });
+      return;
+    }
     if (state === "running" || state === "activity") {
       // Tailed lines keep arriving for seconds after an idle report, and
       // reopening the turn on those would leave the agent running forever —

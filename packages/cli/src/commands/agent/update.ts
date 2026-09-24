@@ -45,7 +45,7 @@ export type AgentUpdateCommandResult = SingleResult<AgentUpdateResult>;
 export interface AgentMetadataChanges {
   name?: string;
   labels?: Record<string, string>;
-  externalTurn?: "running" | "idle";
+  externalTurn?: "running" | "compacting" | "idle";
   externalActivity?: string;
 }
 
@@ -153,15 +153,22 @@ function formatLabels(labels: Record<string, string>): string {
   return entries.map(([key, value]) => `${key}=${value}`).join(",");
 }
 
-function parseExternalTurnOption(value: string | undefined): "running" | "idle" | undefined {
+function parseExternalTurnOption(
+  value: string | undefined,
+): "running" | "compacting" | "idle" | undefined {
   const externalTurn = value?.trim();
-  if (externalTurn === undefined || externalTurn === "running" || externalTurn === "idle") {
+  if (
+    externalTurn === undefined ||
+    externalTurn === "running" ||
+    externalTurn === "compacting" ||
+    externalTurn === "idle"
+  ) {
     return externalTurn;
   }
   throw {
     code: "INVALID_EXTERNAL_TURN",
     message: `Invalid --external-turn value: ${externalTurn}`,
-    details: "Use --external-turn running or --external-turn idle",
+    details: "Use --external-turn running, --external-turn compacting or --external-turn idle",
   } satisfies CommandError;
 }
 

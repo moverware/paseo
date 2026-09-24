@@ -677,7 +677,13 @@ export interface AgentPermissionResult {
  * - `superseded` — the daemon is taking the turn over, so it ends without the
  *   external process having finished anything.
  */
-export type ExternalTurnState = "running" | "activity" | "idle" | "superseded";
+/**
+ * "running"/"idle" are the external process's own reports; "activity" is the
+ * transcript tailer inferring a turn from lines it sees; "compacting" is the
+ * process reporting that it has started summarizing its context; "superseded"
+ * drops the turn because the daemon is about to run it itself.
+ */
+export type ExternalTurnState = "running" | "activity" | "compacting" | "idle" | "superseded";
 
 export interface AgentSession {
   readonly provider: AgentProvider;

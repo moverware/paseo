@@ -982,8 +982,10 @@ export const UpdateAgentRequestMessageSchema = z.object({
   labels: z.record(z.string(), z.string()).optional(),
   // Report from an external process running this agent's turns (e.g. the
   // provider CLI in a terminal pane): "running" with each prompt/tool use,
-  // "idle" when the turn ends. Projects into the agent's status.
-  externalTurn: z.enum(["running", "idle"]).optional(),
+  // "compacting" when it starts summarizing its context (a running turn that
+  // writes nothing to the transcript for minutes), "idle" when the turn ends.
+  // Projects into the agent's status.
+  externalTurn: z.enum(["running", "compacting", "idle"]).optional(),
   // Live one-line activity readout from the external process's UI (elapsed,
   // token counter, current verb) — shown while the turn runs so a long
   // silent stretch is distinguishable from a hang. Transient; never persisted.

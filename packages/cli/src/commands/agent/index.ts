@@ -109,7 +109,7 @@ export function createAgentCommand(): Command {
       )
       .option(
         "--external-turn <state>",
-        "Report the state of a turn running outside the daemon: running or idle",
+        "Report the state of a turn running outside the daemon: running, compacting or idle",
       )
       .option(
         "--external-activity <text>",

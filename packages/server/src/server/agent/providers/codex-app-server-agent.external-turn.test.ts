@@ -556,3 +556,59 @@ describe("codex external turn interplay with the manager seams", () => {
     expect(session.isExternalTurnActive()).toBe(false);
   });
 });
+
+describe("a pane compacting its context", () => {
+  function compactionMarkers(events: AgentStreamEvent[]): string[] {
+    return events.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "compaction" ? [event.item.status] : [],
+    );
+  }
+
+  test("a compacting report opens the turn and posts one loading marker", () => {
+    const session = createSession();
+    const events = collectEvents(session);
+
+    session.noteExternalTurn("compacting");
+    session.noteExternalTurn("compacting");
+
+    expect(session.isExternalTurnActive()).toBe(true);
+    expect(events).toEqual([
+      { type: "turn_started", provider: "codex" },
+      { type: "timeline", provider: "codex", item: { type: "compaction", status: "loading" } },
+    ]);
+  });
+
+  test("the rollout's compacted record completes the marker only when one is open", () => {
+    const session = createSession();
+    const events = collectEvents(session);
+    const compacted = JSON.stringify({
+      timestamp: "2026-09-23T23:47:42.255Z",
+      type: "compacted",
+      payload: { message: "summary", replacement_history: [], window_number: 2 },
+    });
+
+    // A compaction the phone never saw start renders nothing, as for a
+    // daemon-run session.
+    session.noteExternalTurn("running");
+    session.ingestExternalTranscriptLines(`${compacted}\n`);
+    expect(compactionMarkers(events)).toEqual([]);
+
+    session.noteExternalTurn("compacting");
+    session.ingestExternalTranscriptLines(`${compacted}\n`);
+    expect(compactionMarkers(events)).toEqual(["loading", "completed"]);
+
+    session.noteExternalTurn("compacting");
+    expect(compactionMarkers(events)).toEqual(["loading", "completed", "loading"]);
+  });
+
+  test("the marker closes with the turn", () => {
+    const session = createSession();
+    const events = collectEvents(session);
+
+    session.noteExternalTurn("compacting");
+    session.noteExternalTurn("idle");
+    session.noteExternalTurn("compacting");
+
+    expect(compactionMarkers(events)).toEqual(["loading", "loading"]);
+  });
+});

@@ -3083,7 +3083,7 @@ export class Session {
     agentId: string,
     name: string | undefined,
     labels: Record<string, string> | undefined,
-    externalTurn: "running" | "idle" | undefined,
+    externalTurn: "running" | "compacting" | "idle" | undefined,
     externalActivity: string | undefined,
     requestId: string,
   ): Promise<void> {

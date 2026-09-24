@@ -27,15 +27,20 @@ import { normalizeProviderReplayTimestamp } from "../../provider-history-timesta
  *   `threadItemToTimeline` already normalizes PascalCase types; the one gap
  *   is `AgentMessage`, whose rollout form carries `content: [{type: "Text",
  *   text}]` where the app-server form carries `text` — flattened here.
+ * - a top-level `compacted` record — the replacement history written when
+ *   context compaction finishes. The only rollout evidence that a compaction
+ *   ended: the `context_compacted` event_msg is not written on every
+ *   version (absent from 0.156 rollouts, present on 0.154).
  * - everything else (`session_meta`, `response_item`, `turn_context`,
- *   `world_state`, compaction bookkeeping) is not needed for mirroring;
- *   `item_completed` covers everything the timeline renders.
+ *   `world_state`) is not needed for mirroring; `item_completed` covers
+ *   everything the timeline renders.
  */
 
 export type CodexRolloutSignal =
   | { kind: "turn_started" }
   | { kind: "turn_completed" }
   | { kind: "turn_failed"; error: string }
+  | { kind: "compacted" }
   | { kind: "item"; item: Record<string, unknown> };
 
 function codexHome(): string {
@@ -134,6 +139,9 @@ export function parseCodexRolloutLine(line: string): CodexRolloutSignal | null {
     return null;
   }
   const record = toRecord(parsed);
+  if (record?.type === "compacted") {
+    return { kind: "compacted" };
+  }
   if (!record || record.type !== "event_msg") {
     return null;
   }

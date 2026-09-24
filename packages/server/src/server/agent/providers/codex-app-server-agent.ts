@@ -4967,6 +4967,9 @@ export class CodexAppServerAgentSession implements AgentSession {
   private externalTurnOpen = false;
   private deferredExternalTurn = false;
   private externalTurnReportsSeen = false;
+  /** A "Compacting…" marker posted for a compacting report is open until the
+   * rollout's `compacted` record or the turn's end completes it. */
+  private externalCompactionMarkerOpen = false;
   /** Lines tailing in shortly after an idle report are that turn's trailing
    * flush, not a new turn; activity is ignored for this window after idle. */
   private lastExternalIdleAt = 0;
@@ -5065,6 +5068,24 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   noteExternalTurn(state: ExternalTurnState): void {
+    if (state === "compacting") {
+      // The pane's PreCompact hook. Compaction is a model call that writes
+      // nothing to the rollout until its `compacted` record lands, so without
+      // this the phone shows a bare spinner for minutes. Open the turn as a
+      // running report would, then post the same marker a daemon-run
+      // compaction opens; the tailed `compacted` record completes it.
+      this.noteExternalTurn("running");
+      if (!this.externalTurnOpen || this.externalCompactionMarkerOpen) {
+        return;
+      }
+      this.externalCompactionMarkerOpen = true;
+      this.notifySubscribers({
+        type: "timeline",
+        provider: CODEX_PROVIDER,
+        item: { type: "compaction", status: "loading" },
+      });
+      return;
+    }
     if (state === "running" || state === "activity") {
       if (
         state === "activity" &&
@@ -5095,6 +5116,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     this.externalTurnOpen = false;
+    this.externalCompactionMarkerOpen = false;
     if (state === "superseded") {
       // The daemon is about to run this turn itself; emitting turn_completed
       // here would race the foreground turn's own events.
@@ -5163,6 +5185,21 @@ export class CodexAppServerAgentSession implements AgentSession {
           break;
         case "turn_completed":
           this.noteExternalTurn("idle");
+          break;
+        case "compacted":
+          // Completes the "Compacting…" marker a compacting report opened.
+          // Emitted only when one is open: the pane's own compaction is
+          // otherwise invisible on the phone, matching a daemon-run session
+          // whose compaction the app never saw start.
+          if (!this.externalCompactionMarkerOpen) {
+            break;
+          }
+          this.externalCompactionMarkerOpen = false;
+          this.notifySubscribers({
+            type: "timeline",
+            provider: CODEX_PROVIDER,
+            item: { type: "compaction", status: "completed" },
+          });
           break;
         case "turn_failed":
           this.noteExternalTurn("superseded");

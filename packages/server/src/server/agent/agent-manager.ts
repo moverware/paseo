@@ -2444,11 +2444,12 @@ export class AgentManager {
   /**
    * Explicit external-turn report (update_agent_request externalTurn), sent by
    * the external process's own lifecycle hooks: "running" with each prompt and
-   * tool call, "idle" the moment the turn ends. Drives the provider session's
-   * autonomous turn, so the agent's lifecycle, active turn and broadcast state
-   * all move through the same path a daemon-run turn uses.
+   * tool call, "compacting" when it starts summarizing its context, "idle" the
+   * moment the turn ends. Drives the provider session's autonomous turn, so
+   * the agent's lifecycle, active turn and broadcast state all move through
+   * the same path a daemon-run turn uses.
    */
-  reportExternalTurn(agentId: string, state: "running" | "idle"): void {
+  reportExternalTurn(agentId: string, state: "running" | "compacting" | "idle"): void {
     const agent = this.agents.get(agentId);
     agent?.session.noteExternalTurn?.(state);
     if (agent && state === "idle" && agent.externalActivity) {

@@ -67,11 +67,18 @@ all take the paths a daemon-run turn takes. There is no parallel status field.
   with `rehydrateFromDisk` recovers previously omitted errors from provider history.
 - `AgentSession.noteExternalTurn(state)` opens and closes that turn. `running` / `idle` come from
   the external process's lifecycle hooks via `update_agent_request.externalTurn`
-  (`paseo agent update --external-turn running|idle`); `activity` is inferred from tailed lines and
-  is ignored once real reports have arrived, because the tail flushes a turn's last lines seconds
-  after the idle report; `superseded` drops the turn silently when the daemon is about to run one
-  itself. Nothing decays: the turn ends when the external process says so, when the turn is
-  interrupted, or when the daemon takes it over.
+  (`paseo agent update --external-turn running|compacting|idle`); `activity` is inferred from
+  tailed lines and is ignored once real reports have arrived, because the tail flushes a turn's
+  last lines seconds after the idle report; `superseded` drops the turn silently when the daemon
+  is about to run one itself. Nothing decays: the turn ends when the external process says so,
+  when the turn is interrupted, or when the daemon takes it over.
+- `compacting` comes from the process's PreCompact hook. A compaction is one model call that
+  writes nothing to the transcript until it ends, so it would otherwise show as a bare spinner for
+  minutes. The report opens the turn like `running` and posts the same `compaction` loading marker
+  a daemon-run compaction posts; the tailed end record (Claude's `compact_boundary` row, Codex's
+  top-level `compacted` rollout record) completes it, and the turn's end clears it. A Codex end
+  record with no marker open emits nothing, so a compaction the phone never saw start stays
+  invisible, as it is for a daemon-run session.
 - `ClaudeAgentSession.interrupt()` spawns `daemon.externalInterruptCommand` for an external turn,
   so upstream's `cancelAgentRun` reaches the pane with no manager involvement. Slash commands take
   `tryHandleOutOfBand` and spawn `daemon.externalPromptCommand`. Both are argv arrays in the daemon
