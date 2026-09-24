@@ -20,6 +20,8 @@ interface SessionInternals {
     agentId: string,
     title: string,
     labels: Record<string, string>,
+    externalTurn: undefined,
+    externalActivity: undefined,
     requestId: string,
   ): Promise<unknown>;
 }
@@ -163,6 +165,8 @@ describe("snapshot mutation ownership boundary", () => {
       "agent-1",
       "Renamed agent",
       { lane: "phase-1a" },
+      undefined,
+      undefined,
       "req-1",
     );
     expect(updateAgentMetadata).toHaveBeenCalledWith("agent-1", {

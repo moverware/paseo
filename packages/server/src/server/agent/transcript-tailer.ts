@@ -69,18 +69,28 @@ export class TranscriptTailer {
   private readonly options: TranscriptTailerOptions;
   private readonly pollIntervalMs: number;
   private readonly idleAfterMs: number;
-  private readonly idleSweep: ReturnType<typeof setInterval>;
+  private readonly idleSweepIntervalMs: number;
+  /** Runs only while at least one transcript is tailed: a manager with no
+   * external agents owns no recurring timer (fake-timer suites that run every
+   * pending timer would otherwise spin on it forever). */
+  private idleSweep: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: TranscriptTailerOptions) {
     this.options = options;
     this.logger = options.logger.child({ component: "transcript-tailer" });
     this.pollIntervalMs = options.pollIntervalMs ?? TRANSCRIPT_TAILER_DEFAULT_POLL_MS;
     this.idleAfterMs = options.idleAfterMs ?? TRANSCRIPT_IDLE_AFTER_MS;
-    this.idleSweep = setInterval(
-      () => this.closeQuiescentTurns(),
-      options.idleSweepIntervalMs ?? TRANSCRIPT_IDLE_SWEEP_MS,
-    );
-    this.idleSweep.unref?.();
+    this.idleSweepIntervalMs = options.idleSweepIntervalMs ?? TRANSCRIPT_IDLE_SWEEP_MS;
+  }
+
+  private syncIdleSweep(): void {
+    if (this.tailed.size > 0 && !this.idleSweep) {
+      this.idleSweep = setInterval(() => this.closeQuiescentTurns(), this.idleSweepIntervalMs);
+      this.idleSweep.unref?.();
+    } else if (this.tailed.size === 0 && this.idleSweep) {
+      clearInterval(this.idleSweep);
+      this.idleSweep = null;
+    }
   }
 
   /**
@@ -149,6 +159,7 @@ export class TranscriptTailer {
       settleUntil: 0,
     };
     this.tailed.set(agentId, state);
+    this.syncIdleSweep();
     this.logger.info({ agentId, path, offset: state.offset }, "transcript tail armed");
     // Stat polling, not fs.watch: it tolerates the file not existing yet and
     // survives atomic replaces, at a latency that is fine for a chat timeline.
@@ -193,6 +204,7 @@ export class TranscriptTailer {
       clearTimeout(state.resyncTimer);
     }
     this.tailed.delete(agentId);
+    this.syncIdleSweep();
   }
 
   /** Skip everything currently on disk and resume tailing from the end. */
@@ -234,7 +246,6 @@ export class TranscriptTailer {
 
   dispose(): void {
     for (const agentId of this.pending.keys()) this.disarm(agentId);
-    clearInterval(this.idleSweep);
     // Deleting during Map iteration is safe per the iteration protocol.
     for (const agentId of this.tailed.keys()) {
       this.disarm(agentId);
