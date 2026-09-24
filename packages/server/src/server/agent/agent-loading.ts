@@ -6,6 +6,7 @@ import type { AgentStorage } from "./agent-storage.js";
 import {
   buildConfigOverrides,
   buildSessionConfig,
+  extractAttention,
   extractTimestamps,
   isStoredAgentProviderAvailable,
   toAgentPersistenceHandle,
@@ -109,13 +110,16 @@ export async function ensureAgentLoaded(
         handle,
         buildConfigOverrides(record),
         agentId,
-        extractTimestamps(record),
+        { ...extractTimestamps(record), attention: extractAttention(record) },
         // FORK: an externally-driven mirror (origin=herdr) loads for history
         // too — the pane holds the provider's writer (Codex enforces this).
         record.archivedAt || record.labels?.origin === "herdr" ? { purpose: "history" } : undefined,
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
     } else {
+      // No provider handle to resume: this starts the agent's first session rather than
+      // bringing one back, so it stamps activity and carries no stored attention. Records
+      // without a handle never got far enough to accumulate either.
       const config = buildSessionConfig(record, {
         validProviders,
       });

@@ -282,6 +282,7 @@ const AGENT_RUN_START_TIMEOUT_MS = 60_000;
 export async function waitForAgentRunStartWithTimeout(
   agentManager: AgentManager,
   agentId: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const provider = agentManager.getAgent(agentId)?.provider ?? "provider";
   const startAbort = new AbortController();
@@ -296,7 +297,9 @@ export async function waitForAgentRunStartWithTimeout(
   );
 
   try {
-    await agentManager.waitForAgentRunStart(agentId, { signal: startAbort.signal });
+    await agentManager.waitForAgentRunStart(agentId, {
+      signal: signal ? AbortSignal.any([startAbort.signal, signal]) : startAbort.signal,
+    });
   } finally {
     clearTimeout(startTimeout);
   }
