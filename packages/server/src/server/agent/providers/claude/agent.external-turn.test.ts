@@ -623,6 +623,59 @@ printf '%s' "$PASEO_ACTIVE_TURN" > "${evidencePath}.behavior"
     }
   });
 
+  test("sizes a delivered /model for the pane's pool auth while the timeline keeps the user's text", async () => {
+    const { evidencePath } = configurePromptCommand();
+    const savedBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:8317";
+    process.env.ANTHROPIC_AUTH_TOKEN = "key";
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      const handler = session.tryHandleOutOfBand?.("/model claude-opus-5-5");
+      const emitted: AgentStreamEvent[] = [];
+      await handler?.run({ emit: (event) => emitted.push(event) });
+
+      expect(emitted).toEqual([
+        {
+          type: "timeline",
+          provider: "claude",
+          item: { type: "user_message", text: "/model claude-opus-5-5" },
+        },
+      ]);
+      await vi.waitFor(() => {
+        expect(readFileSync(evidencePath, "utf8")).toBe("/model claude-opus-5-5[1m]");
+      });
+    } finally {
+      await close();
+      if (savedBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = savedBaseUrl;
+      if (savedToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+      else process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
+    }
+  });
+
+  test("delivers a /model unchanged under subscription auth", async () => {
+    const { evidencePath } = configurePromptCommand();
+    const savedBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      const handler = session.tryHandleOutOfBand?.("/model claude-opus-5-5");
+      await handler?.run({ emit: () => {} });
+      await vi.waitFor(() => {
+        expect(readFileSync(evidencePath, "utf8")).toBe("/model claude-opus-5-5");
+      });
+    } finally {
+      await close();
+      if (savedBaseUrl !== undefined) process.env.ANTHROPIC_BASE_URL = savedBaseUrl;
+      if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
+    }
+  });
+
   test("stays silent when the manager already committed the client's message", async () => {
     const { evidencePath } = configurePromptCommand();
     const { session, close } = await createSession();

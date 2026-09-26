@@ -42,8 +42,11 @@ import {
   parseClaudeCodeVersion,
   resolveClaudeDisabledThinkingForModel,
 } from "./model-manifest.js";
-// FORK: [1m] suffix for pool-authed spawns.
-import { applyFableOneMillionSuffix } from "./fable-context-suffix.js";
+// FORK: [1m] suffix for pool-authed spawns and pane deliveries.
+import {
+  applyPoolContextSuffix,
+  applyPoolContextSuffixToModelCommand,
+} from "./pool-context-suffix.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import { ClaudeTaskState } from "./task-state.js";
@@ -2842,7 +2845,14 @@ class ClaudeAgentSession implements AgentSession {
     const agentId = this.externalAgentId ?? this.agentId;
     const imagePaths =
       directPrompts && agentId ? persistPromptImages(agentId, prompt, this.logger) : [];
-    const delivered = withImagePathsAppendix(text, imagePaths);
+    // FORK: the pane runs under the same pool env as this daemon's children,
+    // so a /model it receives needs the same [1m] sizing as a spawned child's
+    // model option (pool-context-suffix.ts). The timeline keeps the user's
+    // text; the transcript echo carries the suffixed id and is matched on it.
+    const delivered = withImagePathsAppendix(
+      applyPoolContextSuffixToModelCommand(text, this.buildSdkEnv()),
+      imagePaths,
+    );
     if (!delivered) return null;
     // With a clientMessageId the manager commits the user's row itself, and
     // reconciles the client's optimistic bubble against it; without one
@@ -3920,9 +3930,9 @@ class ClaudeAgentSession implements AgentSession {
       base.model = this.config.model;
     }
     this.lastOptionsModel = base.model ?? null;
-    // FORK: see fable-context-suffix.ts — bookkeeping above stays on the
+    // FORK: see pool-context-suffix.ts — bookkeeping above stays on the
     // canonical id; only the spawned process sees the suffixed one.
-    base.model = applyFableOneMillionSuffix(base.model, sdkEnv);
+    base.model = applyPoolContextSuffix(base.model, sdkEnv);
     if (this.claudeSessionId && !this.pendingFreshSessionId) {
       base.resume = this.claudeSessionId;
     }
