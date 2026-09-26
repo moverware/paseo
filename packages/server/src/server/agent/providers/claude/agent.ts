@@ -791,6 +791,38 @@ function readTranscriptModelEvidence(entry: unknown): string | null {
   return args || null;
 }
 
+const EFFORT_SWITCH_STDOUT = "<local-command-stdout>Set effort level to ";
+
+/** Effort evidence in one raw transcript entry: the level Claude Code stamps
+ * on a main-thread assistant entry (what actually ran, after any downgrade
+ * for the model), or the confirmation a /effort run prints, which lands
+ * before the next assistant entry can prove it. Subagent entries carry their
+ * own level and say nothing about the conversation's. */
+function readTranscriptEffort(entry: unknown): ClaudeThinkingOption | null {
+  const record = entry as {
+    type?: string;
+    isSidechain?: unknown;
+    effort?: unknown;
+    message?: { content?: unknown };
+  };
+  if (record?.isSidechain === true) {
+    return null;
+  }
+  if (record?.type === "assistant") {
+    return typeof record.effort === "string" && isClaudeThinkingEffort(record.effort)
+      ? record.effort
+      : null;
+  }
+  const content = record?.type === "user" ? record.message?.content : null;
+  if (typeof content !== "string" || !content.startsWith(EFFORT_SWITCH_STDOUT)) {
+    return null;
+  }
+  const level = content.slice(EFFORT_SWITCH_STDOUT.length).match(/^\w+/)?.[0];
+  return level && level !== CLAUDE_DISABLED_THINKING_OPTION_ID && isClaudeThinkingOption(level)
+    ? level
+    : null;
+}
+
 /**
  * Replay at most this many user turns into the timeline. Long sessions
  * replayed in full re-render the client's whole thread on every reload
@@ -2218,6 +2250,8 @@ class ClaudeAgentSession implements AgentSession {
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
+  /** FORK: effort stamped on the external process's latest assistant entry. */
+  private externalEffort: ClaudeThinkingOption | null = null;
   private compacting = false;
   private compactionMarkerOpen = false;
   private queryPumpPromise: Promise<void> | null = null;
@@ -2305,6 +2339,7 @@ class ClaudeAgentSession implements AgentSession {
       sessionId: this.claudeSessionId,
       model: this.lastOptionsModel,
       modeId: this.currentMode ?? null,
+      ...(this.externalEffort ? { thinkingOptionId: this.externalEffort } : {}),
       ...(this.lastRuntimeModel
         ? {
             extra: {
@@ -2672,6 +2707,7 @@ class ClaudeAgentSession implements AgentSession {
     // by the ingest itself, and the subagents track is rebuilt on replay.
     const replay: ClaudeReplayOwnership = { restoredIds: new Set(), toolOwners: new Map() };
     const modelBefore = this.lastOptionsModel;
+    const effortBefore = this.externalEffort;
     const blockedNotes: string[] = [];
     for (const line of content.split(/\r?\n/)) {
       if (this.isLiveTranscriptLine(line)) {
@@ -2682,7 +2718,7 @@ class ClaudeAgentSession implements AgentSession {
         continue;
       }
       this.ingestPersistedHistoryLine(line, timeline, replay);
-      this.captureExternalRuntimeModel(line);
+      this.captureExternalRuntime(line);
       const blocked = extractBlockedPromptNote(line);
       if (blocked) {
         blockedNotes.push(blocked);
@@ -2726,6 +2762,13 @@ class ClaudeAgentSession implements AgentSession {
       // refresh so the client's selector moves on the same path a daemon-side
       // switch uses.
       void this.emitExternalModelChange();
+    }
+    if (this.externalEffort !== effortBefore) {
+      this.notifySubscribers({
+        type: "thinking_option_changed",
+        provider: "claude",
+        thinkingOptionId: this.externalEffort,
+      });
     }
   }
 
@@ -2935,21 +2978,35 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
-   * Track the model the EXTERNAL process is actually using, from the models
-   * stamped on its assistant transcript entries. A /model switch in the
-   * external CLI never touches this daemon-side session, so without this the
-   * client's model selector stays stale until the next full reload.
+   * Track the model and effort the EXTERNAL process is actually using, from
+   * what it stamps on its transcript entries. A /model or /effort switch in
+   * the external CLI never touches this daemon-side session, so without this
+   * the client's selectors show the launch config (or the model's default
+   * effort) until the next full reload.
    */
-  private captureExternalRuntimeModel(line: string): void {
-    if (!line.includes('"model"') && !line.includes("<command-name>/model")) {
+  private captureExternalRuntime(line: string): void {
+    if (
+      !line.includes('"model"') &&
+      !line.includes("<command-name>/model") &&
+      !line.includes(EFFORT_SWITCH_STDOUT)
+    ) {
       return;
     }
-    let model: string | null = null;
+    let entry: unknown;
     try {
-      model = readTranscriptModelEvidence(JSON.parse(line));
+      entry = JSON.parse(line);
     } catch {
       return;
     }
+    const effort = readTranscriptEffort(entry);
+    // Ultra Code runs as xhigh plus orchestration and stamps "xhigh".
+    const ultracodeStamp =
+      effort === "xhigh" && this.externalEffort === CLAUDE_ULTRACODE_THINKING_OPTION_ID;
+    if (effort && effort !== this.externalEffort && !ultracodeStamp) {
+      this.externalEffort = effort;
+      this.cachedRuntimeInfo = null;
+    }
+    const model = readTranscriptModelEvidence(entry);
     if (!model || model === this.lastRuntimeModel) {
       return;
     }
@@ -3052,10 +3109,38 @@ class ClaudeAgentSession implements AgentSession {
     } else {
       throw new Error(`Unknown thinking option: ${normalizedThinkingOptionId}`);
     }
+    this.externalEffort = this.deliverExternalEffort(this.config.thinkingOptionId);
+    this.cachedRuntimeInfo = null;
     this.queryRestartNeeded = true;
     if (this.activeForegroundTurnId || this.autonomousTurn) {
       return THINKING_APPLIES_NEXT_TURN_NOTICE;
     }
+  }
+
+  /**
+   * FORK: an externally-driven agent's effort lives in the external process,
+   * so a level chosen here goes out as /effort, the same way a model switch
+   * goes out as /model. Returns the level to report until the transcript
+   * stamps what ran; null when nothing was delivered.
+   */
+  private deliverExternalEffort(thinkingOptionId: string | undefined): ClaudeThinkingOption | null {
+    if (
+      !this.isExternallyDriven() ||
+      !thinkingOptionId ||
+      thinkingOptionId === CLAUDE_DISABLED_THINKING_OPTION_ID ||
+      !isClaudeThinkingOption(thinkingOptionId)
+    ) {
+      return null;
+    }
+    const prompt = `/effort ${thinkingOptionId}`;
+    this.externalEchoes.record(prompt);
+    const delivered = spawnExternalTurnCommand({
+      kind: "prompt",
+      identity: this.externalIdentity(),
+      prompt,
+      logger: this.logger,
+    });
+    return delivered ? thinkingOptionId : null;
   }
 
   async setFeature(featureId: string, value: unknown): Promise<void> {
@@ -5553,7 +5638,7 @@ class ClaudeAgentSession implements AgentSession {
     const timeline: PersistedTimelineEntry[] = [];
     for (const line of content.split(/\r?\n/)) {
       this.ingestPersistedHistoryLine(line, timeline, replay);
-      this.captureExternalRuntimeModel(line);
+      this.captureExternalRuntime(line);
     }
 
     if (timeline.length > 0) {

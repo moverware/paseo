@@ -4125,6 +4125,11 @@ export class AgentManager {
         newInfo.sessionId !== agent.runtimeInfo?.sessionId ||
         newInfo.modeId !== agent.runtimeInfo?.modeId;
       agent.runtimeInfo = newInfo;
+      // FORK: a provider that observes the level actually running (an external
+      // process's transcript) reports it here; the snapshot reads config.
+      if (typeof newInfo.thinkingOptionId === "string") {
+        agent.config.thinkingOptionId = newInfo.thinkingOptionId;
+      }
       if (!agent.persistence && newInfo.sessionId) {
         agent.persistence = attachPersistenceCwd(
           { provider: agent.provider, sessionId: newInfo.sessionId },

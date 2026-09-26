@@ -43,6 +43,20 @@ function assistantLine(model: string): string {
   });
 }
 
+function effortLine(effort: string, options?: { sidechain?: boolean; uuid?: string }): string {
+  return JSON.stringify({
+    type: "assistant",
+    uuid: options?.uuid ?? `e-${effort}`,
+    isSidechain: options?.sidechain ?? false,
+    effort,
+    message: {
+      role: "assistant",
+      model: "claude-opus-5-5",
+      content: [{ type: "text", text: "ok" }],
+    },
+  });
+}
+
 function modelCommandLine(args: string): string {
   return JSON.stringify({
     type: "user",
@@ -133,6 +147,74 @@ describe("mirroring the external process's model", () => {
       );
 
       expect((await session.getRuntimeInfo()).model).toBeNull();
+    } finally {
+      await session.close();
+    }
+  });
+});
+
+/**
+ * Effort is stamped on every assistant entry the external process writes. The
+ * pane can run at any level (its /effort, a saved default), and the client
+ * otherwise shows the model's default level instead.
+ */
+describe("mirroring the external process's effort", () => {
+  test("reports the effort stamped on an assistant entry", async () => {
+    const session = await createSession("claude-opus-5-5");
+    const events: Array<{ type: string; thinkingOptionId?: string | null }> = [];
+    const unsubscribe = session.subscribe((event) => {
+      events.push(event as (typeof events)[number]);
+    });
+    try {
+      session.ingestExternalTranscriptLines?.(`${effortLine("high")}\n`);
+
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("high");
+      expect(events.filter((e) => e.type === "thinking_option_changed")).toEqual([
+        expect.objectContaining({ thinkingOptionId: "high" }),
+      ]);
+
+      session.ingestExternalTranscriptLines?.(`${effortLine("high", { uuid: "e-2" })}\n`);
+      expect(events.filter((e) => e.type === "thinking_option_changed")).toHaveLength(1);
+    } finally {
+      unsubscribe();
+      await session.close();
+    }
+  });
+
+  test("ignores a subagent's effort", async () => {
+    const session = await createSession("claude-opus-5-5");
+    try {
+      session.ingestExternalTranscriptLines?.(
+        `${effortLine("xhigh")}\n${effortLine("low", { sidechain: true, uuid: "e-sub" })}\n`,
+      );
+
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("xhigh");
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("reports nothing until an entry stamps an effort", async () => {
+    const session = await createSession("claude-opus-5-5");
+    try {
+      session.ingestExternalTranscriptLines?.(`${assistantLine("claude-opus-5-5")}\n`);
+
+      expect(await session.getRuntimeInfo()).not.toHaveProperty("thinkingOptionId");
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("an explicit choice replaces the observed level until the next stamp", async () => {
+    const session = await createSession("claude-opus-5-5");
+    try {
+      session.ingestExternalTranscriptLines?.(`${effortLine("high")}\n`);
+      await session.setThinkingOption?.("max");
+
+      expect(await session.getRuntimeInfo()).not.toHaveProperty("thinkingOptionId");
+
+      session.ingestExternalTranscriptLines?.(`${effortLine("medium")}\n`);
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("medium");
     } finally {
       await session.close();
     }

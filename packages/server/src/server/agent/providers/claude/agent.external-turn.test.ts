@@ -623,6 +623,54 @@ printf '%s' "$PASEO_ACTIVE_TURN" > "${evidencePath}.behavior"
     }
   });
 
+  test("delivers an effort choice to the pane as /effort and reports it", async () => {
+    const { evidencePath } = configurePromptCommand();
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      await session.setThinkingOption?.("xhigh");
+
+      await vi.waitFor(() => {
+        expect(readFileSync(evidencePath, "utf8")).toBe("/effort xhigh");
+      });
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("xhigh");
+    } finally {
+      await close();
+    }
+  });
+
+  test("follows a /effort the pane ran before any assistant entry stamps it", async () => {
+    const { session, close } = await createSession();
+    try {
+      markExternallyDriven(session);
+      session.ingestExternalTranscriptLines?.(
+        `${JSON.stringify({
+          type: "user",
+          uuid: "u-effort",
+          message: {
+            role: "user",
+            content:
+              "<local-command-stdout>Set effort level to ultracode (this session only): xhigh + dynamic workflow orchestration</local-command-stdout>",
+          },
+        })}\n`,
+      );
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("ultracode");
+
+      // Ultra Code runs as xhigh and stamps that; it is still Ultra Code.
+      session.ingestExternalTranscriptLines?.(
+        `${JSON.stringify({
+          type: "assistant",
+          uuid: "a-uc",
+          effort: "xhigh",
+          message: { role: "assistant", model: "claude-opus-5-5", content: [] },
+        })}\n`,
+      );
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("ultracode");
+    } finally {
+      await close();
+    }
+  });
+
   test("stays silent when the manager already committed the client's message", async () => {
     const { evidencePath } = configurePromptCommand();
     const { session, close } = await createSession();
