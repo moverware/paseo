@@ -42,6 +42,7 @@ import {
 import { importSessionFromPersistence } from "../provider-session-import.js";
 // FORK: external-turn support for Codex TUI panes (see the fork notes in CLAUDE.md).
 import {
+  EXTERNAL_CODEX_EFFORT_NOTICE,
   EXTERNAL_DELIVERY_FAILED,
   EXTERNAL_ORIGIN_LABEL,
   EXTERNAL_QUESTION_ALREADY_RESOLVED,
@@ -54,6 +55,7 @@ import { ExternalEchoLedger, promptEchoText } from "../external-echo-ledger.js";
 import { persistPromptImages, withImagePathsAppendix } from "../prompt-images.js";
 import {
   parseCodexRolloutLine,
+  readLatestCodexRolloutEffort,
   codexTurnErrorHistory,
   resolveCodexRolloutPath,
 } from "./codex/external-rollout.js";
@@ -4533,7 +4535,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       provider: CODEX_PROVIDER,
       sessionId: this.currentThreadId,
       model: this.config.model ?? null,
-      thinkingOptionId: normalizeCodexThinkingOptionId(this.config.thinkingOptionId) ?? null,
+      thinkingOptionId:
+        this.externalEffort ?? normalizeCodexThinkingOptionId(this.config.thinkingOptionId) ?? null,
       modeId: this.currentMode ?? null,
       extra: this.resolvedCollaborationMode
         ? { collaborationMode: this.resolvedCollaborationMode.name }
@@ -4575,6 +4578,13 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void | AgentProviderNotice> {
+    // FORK: the pane runs its own effort and the Codex TUI takes no effort
+    // argument (/model opens a picker), so a level chosen here cannot reach
+    // it. Say so instead of letting the selector snap back to what the
+    // rollout reports.
+    if (this.externalEffort && this.isExternallyDriven()) {
+      return EXTERNAL_CODEX_EFFORT_NOTICE;
+    }
     this.config.thinkingOptionId = normalizeCodexThinkingOptionId(thinkingOptionId);
     this.refreshResolvedCollaborationMode();
     this.cachedRuntimeInfo = null;
@@ -5040,6 +5050,19 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly externalEchoes = new ExternalEchoLedger();
   private cachedExternalTranscriptPath: string | null = null;
   private boundExternalSession = false;
+  /** Effort of the rollout's latest turn: what the pane actually runs. */
+  private externalEffort: string | null = null;
+
+  private adoptExternalEffort(effort: string | null): void {
+    if (!effort || effort === this.externalEffort) return;
+    this.externalEffort = effort;
+    this.cachedRuntimeInfo = null;
+    this.notifySubscribers({
+      type: "thinking_option_changed",
+      provider: CODEX_PROVIDER,
+      thinkingOptionId: effort,
+    });
+  }
 
   bindExternalSession(handle: { sessionId: string; transcriptPath: string }): void {
     this.currentThreadId = handle.sessionId;
@@ -5052,6 +5075,15 @@ export class CodexAppServerAgentSession implements AgentSession {
   noteExternalIdentity(identity: { agentId: string; labels: Record<string, string> }): void {
     this.externalAgentId = identity.agentId;
     this.externalLabels = identity.labels;
+    // The tail only sees turns from here on; a reloaded thread reports the
+    // level its pane already runs from the latest turn on disk.
+    const transcriptPath =
+      this.externalEffort === null && this.isExternallyDriven()
+        ? this.externalTranscriptPath()
+        : null;
+    if (transcriptPath) {
+      this.adoptExternalEffort(readLatestCodexRolloutEffort(transcriptPath));
+    }
   }
 
   private isExternallyDriven(): boolean {
@@ -5247,6 +5279,9 @@ export class CodexAppServerAgentSession implements AgentSession {
           break;
         case "turn_completed":
           this.noteExternalTurn("idle");
+          break;
+        case "effort":
+          this.adoptExternalEffort(signal.effort);
           break;
         case "compacted":
           // Completes the "Compacting…" marker a compacting report opened.

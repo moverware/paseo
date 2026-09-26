@@ -31,9 +31,13 @@ import { normalizeProviderReplayTimestamp } from "../../provider-history-timesta
  *   context compaction finishes. The only rollout evidence that a compaction
  *   ended: the `context_compacted` event_msg is not written on every
  *   version (absent from 0.156 rollouts, present on 0.154).
- * - everything else (`session_meta`, `response_item`, `turn_context`,
- *   `world_state`) is not needed for mirroring; `item_completed` covers
- *   everything the timeline renders.
+ * - `turn_context` — written at the start of every turn with the settings
+ *   the turn runs under; `payload.effort` is the reasoning effort the pane
+ *   actually used (measured on 0.157.1: also mirrored at
+ *   `payload.collaboration_mode.settings.reasoning_effort`).
+ * - everything else (`session_meta`, `response_item`, `world_state`) is not
+ *   needed for mirroring; `item_completed` covers everything the timeline
+ *   renders.
  */
 
 export type CodexRolloutSignal =
@@ -41,6 +45,7 @@ export type CodexRolloutSignal =
   | { kind: "turn_completed" }
   | { kind: "turn_failed"; error: string }
   | { kind: "compacted" }
+  | { kind: "effort"; effort: string }
   | { kind: "item"; item: Record<string, unknown> };
 
 function codexHome(): string {
@@ -142,6 +147,10 @@ export function parseCodexRolloutLine(line: string): CodexRolloutSignal | null {
   if (record?.type === "compacted") {
     return { kind: "compacted" };
   }
+  if (record?.type === "turn_context") {
+    const effort = readTurnContextEffort(record.payload);
+    return effort ? { kind: "effort", effort } : null;
+  }
   if (!record || record.type !== "event_msg") {
     return null;
   }
@@ -162,6 +171,51 @@ export function parseCodexRolloutLine(line: string): CodexRolloutSignal | null {
     }
     default:
       return null;
+  }
+}
+
+function readTurnContextEffort(payload: unknown): string | null {
+  const effort = toRecord(payload)?.effort;
+  return typeof effort === "string" && effort.trim() ? effort.trim() : null;
+}
+
+const TURN_CONTEXT_MARKER = '"type":"turn_context"';
+const BACKWARD_READ_CHUNK = 256 * 1024;
+
+/**
+ * The effort of the latest turn in a rollout. Rollouts run to tens of MB and
+ * the answer is near the end, so this reads backwards in chunks and stops at
+ * the last `turn_context` line.
+ */
+export function readLatestCodexRolloutEffort(rolloutPath: string): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(rolloutPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    let end = fs.fstatSync(fd).size;
+    let carry = "";
+    while (end > 0) {
+      const start = Math.max(0, end - BACKWARD_READ_CHUNK);
+      const buffer = Buffer.alloc(end - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      const lines = (buffer.toString("utf8") + carry).split("\n");
+      // The first piece may be a partial line; it completes with the next chunk.
+      carry = start > 0 ? (lines.shift() ?? "") : "";
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        if (!lines[i].includes(TURN_CONTEXT_MARKER)) continue;
+        const signal = parseCodexRolloutLine(lines[i]);
+        if (signal?.kind === "effort") return signal.effort;
+      }
+      end = start;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
   }
 }
 

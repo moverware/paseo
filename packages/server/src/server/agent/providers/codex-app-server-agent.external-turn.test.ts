@@ -612,3 +612,68 @@ describe("a pane compacting its context", () => {
     expect(compactionMarkers(events)).toEqual(["loading", "loading"]);
   });
 });
+
+/**
+ * FORK: the pane runs its own reasoning effort. Each turn's `turn_context`
+ * line records it; without reading that, the client shows the configured
+ * level (usually none, so "auto") instead of what the pane runs.
+ */
+describe("codex external effort", () => {
+  function turnContextLine(effort: string): string {
+    return JSON.stringify({
+      timestamp: "2026-09-26T19:00:00.000Z",
+      type: "turn_context",
+      payload: { turn_id: "t1", model: "gpt-6-astra", effort },
+    });
+  }
+
+  function createPaneSession(): TestSession {
+    const session = createSession();
+    session.bindExternalSession({ sessionId: THREAD_ID, transcriptPath: "" });
+    session.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
+    return session;
+  }
+
+  test("a tailed turn_context reports its effort once", async () => {
+    const session = createPaneSession();
+    const events = collectEvents(session);
+
+    session.ingestExternalTranscriptLines(`${turnContextLine("high")}\n`);
+    session.ingestExternalTranscriptLines(`${turnContextLine("high")}\n`);
+
+    expect(events).toEqual([
+      { type: "thinking_option_changed", provider: "codex", thinkingOptionId: "high" },
+    ]);
+    expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("high");
+  });
+
+  test("a reloaded pane reports the latest turn's effort already on disk", async () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-effort-"));
+    try {
+      const transcriptPath = join(home, `rollout-${THREAD_ID}.jsonl`);
+      // Big enough that the backward read crosses a chunk boundary.
+      const filler = rolloutLine({ type: "token_count", pad: "x".repeat(300_000) });
+      writeFileSync(
+        transcriptPath,
+        [turnContextLine("low"), filler, turnContextLine("xhigh"), filler, ""].join("\n"),
+      );
+      const session = createSession();
+      session.bindExternalSession({ sessionId: THREAD_ID, transcriptPath });
+      session.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
+
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("xhigh");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("an effort change for a pane is refused with a notice, not applied", async () => {
+    const session = createPaneSession();
+    session.ingestExternalTranscriptLines(`${turnContextLine("high")}\n`);
+
+    const notice = await session.setThinkingOption("low");
+
+    expect(notice).toMatchObject({ type: "warning" });
+    expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("high");
+  });
+});
