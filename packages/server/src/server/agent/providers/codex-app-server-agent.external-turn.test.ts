@@ -667,13 +667,68 @@ describe("codex external effort", () => {
     }
   });
 
-  test("an effort change for a pane is refused with a notice, not applied", async () => {
-    const session = createPaneSession();
-    session.ingestExternalTranscriptLines(`${turnContextLine("high")}\n`);
+  test("an effort change for a pane selects the requested native picker level", async () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-effort-switch-"));
+    const out = join(home, "env.txt");
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({
+        daemon: { externalPromptCommand: ["/bin/sh", "-c", `env > "${out}"`] },
+      }),
+    );
+    const originalHome = process.env.PASEO_HOME;
+    process.env.PASEO_HOME = home;
+    try {
+      const session = createPaneSession();
+      session.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
 
-    const notice = await session.setThinkingOption("low");
+      const notice = await session.setThinkingOption("high");
 
-    expect(notice).toMatchObject({ type: "warning" });
-    expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("high");
+      expect(notice).toBeUndefined();
+      const deadline = Date.now() + 5000;
+      while (!existsSync(out) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const env = readFileSync(out, "utf8");
+      expect(env).toContain("PASEO_CODEX_EFFORT=high");
+      expect(env).toContain("PASEO_PROMPT=/model gpt-5.4");
+      expect((await session.getRuntimeInfo()).thinkingOptionId).toBe("high");
+    } finally {
+      if (originalHome === undefined) delete process.env.PASEO_HOME;
+      else process.env.PASEO_HOME = originalHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a model switch carries the pane's selected effort to the native picker", async () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-model-switch-"));
+    const out = join(home, "env.txt");
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({
+        daemon: { externalPromptCommand: ["/bin/sh", "-c", `env > "${out}"`] },
+      }),
+    );
+    const originalHome = process.env.PASEO_HOME;
+    process.env.PASEO_HOME = home;
+    try {
+      const session = createSession({ thinkingOptionId: "high" });
+      session.bindExternalSession({ sessionId: THREAD_ID, transcriptPath: "" });
+      session.noteExternalIdentity({ agentId: "agent-1", labels: { origin: "herdr" } });
+
+      const handler = session.tryHandleOutOfBand("/model gpt-5.6");
+      expect(handler).not.toBeNull();
+      await handler?.run({ emit: () => {} });
+
+      await vi.waitFor(() => {
+        const env = readFileSync(out, "utf8");
+        expect(env).toContain("PASEO_CODEX_EFFORT=high");
+        expect(env).toContain("PASEO_PROMPT=/model gpt-5.6");
+      });
+    } finally {
+      if (originalHome === undefined) delete process.env.PASEO_HOME;
+      else process.env.PASEO_HOME = originalHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

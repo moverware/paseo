@@ -39,11 +39,10 @@ export const EXTERNAL_DELIVERY_FAILED =
   "[System Error] This message did not reach the terminal session that runs this " +
   "conversation. Check that its pane is open and send it again.";
 
-/** Reply to an effort change for a Codex pane: the Codex TUI has no command
- * that sets effort from typed text, so the level stays whatever the pane runs. */
+/** Reply when the Codex pane cannot receive an effort change. */
 export const EXTERNAL_CODEX_EFFORT_NOTICE: AgentProviderNotice = {
   type: "warning",
-  message: "Change effort in the terminal pane with /model; Codex takes no effort command.",
+  message: "The terminal pane could not receive the selected Codex reasoning level.",
 };
 
 /** Exit code the external prompt command returns when asked to answer a
@@ -111,6 +110,8 @@ export function spawnExternalTurnCommand(params: {
   identity: ExternalAgentIdentity;
   logger: Logger;
   prompt?: string;
+  /** Requested Codex reasoning level for a `/model` picker. */
+  codexEffort?: string;
   /** Sender's interrupt/steer choice for a running turn, delivered as PASEO_ACTIVE_TURN. */
   activeTurnBehavior?: "interrupt" | "steer";
   /** Called when the command exits non-zero: the external process was not
@@ -121,7 +122,8 @@ export function spawnExternalTurnCommand(params: {
    * Delivered as PASEO_QUESTION. */
   question?: "answer" | "dismiss";
 }): boolean {
-  const { kind, identity, logger, prompt, activeTurnBehavior, onFailure, question } = params;
+  const { kind, identity, logger, prompt, codexEffort, activeTurnBehavior, onFailure, question } =
+    params;
   const argv = readExternalTurnCommand(kind);
   if (!argv) {
     return false;
@@ -137,6 +139,7 @@ export function spawnExternalTurnCommand(params: {
         PASEO_AGENT_LABELS: JSON.stringify(identity.labels),
         PASEO_AGENT_PROVIDER: identity.provider ?? "claude",
         ...(prompt === undefined ? {} : { PASEO_PROMPT: prompt }),
+        ...(codexEffort === undefined ? {} : { PASEO_CODEX_EFFORT: codexEffort }),
         ...(activeTurnBehavior === undefined ? {} : { PASEO_ACTIVE_TURN: activeTurnBehavior }),
         ...(question === undefined ? {} : { PASEO_QUESTION: question }),
       },

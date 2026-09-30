@@ -4578,14 +4578,35 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void | AgentProviderNotice> {
-    // FORK: the pane runs its own effort and the Codex TUI takes no effort
-    // argument (/model opens a picker), so a level chosen here cannot reach
-    // it. Say so instead of letting the selector snap back to what the
-    // rollout reports.
-    if (this.externalEffort && this.isExternallyDriven()) {
-      return EXTERNAL_CODEX_EFFORT_NOTICE;
+    const normalizedThinkingOptionId = normalizeCodexThinkingOptionId(thinkingOptionId) ?? null;
+    // FORK: Codex exposes effort through the same native `/model` picker as a
+    // model switch. Re-open that picker for a pane session and have the
+    // external prompt command select the requested level before committing it.
+    if (this.isExternallyDriven()) {
+      const modelId = normalizeCodexModelId(this.config.model);
+      if (!modelId || readExternalTurnCommand("prompt") === null) {
+        return EXTERNAL_CODEX_EFFORT_NOTICE;
+      }
+      this.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
+      this.externalEffort = normalizedThinkingOptionId;
+      this.cachedRuntimeInfo = null;
+      this.externalEchoes.record(`/model ${modelId}`);
+      const delivered = spawnExternalTurnCommand({
+        kind: "prompt",
+        identity: this.externalIdentity(),
+        prompt: `/model ${modelId}`,
+        codexEffort: normalizedThinkingOptionId ?? undefined,
+        logger: this.logger,
+      });
+      if (!delivered) {
+        return EXTERNAL_CODEX_EFFORT_NOTICE;
+      }
+      if (this.activeForegroundTurnId) {
+        return THINKING_APPLIES_NEXT_TURN_NOTICE;
+      }
+      return;
     }
-    this.config.thinkingOptionId = normalizeCodexThinkingOptionId(thinkingOptionId);
+    this.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
     this.refreshResolvedCollaborationMode();
     this.cachedRuntimeInfo = null;
     if (this.activeForegroundTurnId) {
@@ -5130,6 +5151,12 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!delivered) {
       return null;
     }
+    const codexEffort =
+      typeof prompt === "string" && /^\/model(?:\s|$)/.test(prompt)
+        ? (this.externalEffort ??
+          normalizeCodexThinkingOptionId(this.config.thinkingOptionId) ??
+          undefined)
+        : undefined;
     // With a clientMessageId the manager commits the user's row itself;
     // without one (CLI, MCP, schedules) nothing has recorded the message yet.
     const shouldEmitUserMessage = !options?.clientMessageId;
@@ -5147,6 +5174,7 @@ export class CodexAppServerAgentSession implements AgentSession {
           kind: "prompt",
           identity: this.externalIdentity(),
           prompt: delivered,
+          codexEffort,
           activeTurnBehavior: options?.activeTurnBehavior,
           logger: this.logger,
           onFailure: () => {
