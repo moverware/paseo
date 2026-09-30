@@ -4184,6 +4184,37 @@ class ClaudeAgentSession implements AgentSession {
     return this.recentStderr.trim() || undefined;
   }
 
+  /**
+   * A routed prompt is deliberately refused by the daemon-side Claude child
+   * after the hook has handed it to the live pane. Claude's SDK can close that
+   * query without emitting its normal terminal result, so the ordinary
+   * end-of-stream guard must not turn an accepted handoff into a failed phone
+   * turn.
+   */
+  private completeRoutedForegroundTurn(): boolean {
+    if (!this.activeForegroundTurnId) {
+      return false;
+    }
+    const stderr = this.getRecentStderrDiagnostic() ?? "";
+    const routed = extractRoutedHookNote(stderr) !== null;
+    if (!routed && !this.deferredExternalTurn) {
+      return false;
+    }
+    // The handoff is the continuation. Keep the lifecycle busy even when the
+    // external running report is still in flight, then open the pane turn as
+    // soon as this daemon-side query settles.
+    this.deferredExternalTurn = true;
+    this.finishForegroundTurn({ type: "turn_completed", provider: "claude" });
+    return true;
+  }
+
+  private finishQueryPumpTurn(errorMessage: string): void {
+    if (this.completeRoutedForegroundTurn()) {
+      return;
+    }
+    this.failActiveTurns(errorMessage);
+  }
+
   private async awaitRecentStderrAfterProcessExit(error: unknown): Promise<void> {
     if (this.getRecentStderrDiagnostic()) {
       return;
@@ -4506,7 +4537,7 @@ class ClaudeAgentSession implements AgentSession {
             return;
           }
           if (!this.closed && this.query === activeQuery) {
-            this.failActiveTurns("Claude stream ended before terminal result");
+            this.finishQueryPumpTurn("Claude stream ended before terminal result");
           }
           return;
         } catch (error) {
@@ -4524,7 +4555,9 @@ class ClaudeAgentSession implements AgentSession {
           }
           if (!this.closed && this.query === activeQuery) {
             await this.awaitRecentStderrAfterProcessExit(error);
-            this.failActiveTurns(error instanceof Error ? error.message : "Claude stream failed");
+            this.finishQueryPumpTurn(
+              error instanceof Error ? error.message : "Claude stream failed",
+            );
           }
           return;
         }

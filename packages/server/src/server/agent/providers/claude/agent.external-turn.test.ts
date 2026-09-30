@@ -26,6 +26,17 @@ function createIdleQueryMock(): Query {
   } as Query;
 }
 
+function createGatedQueryMock(queryGate: Promise<void>): Query {
+  const next = async () => {
+    await queryGate;
+    return { done: true, value: undefined };
+  };
+  return {
+    ...createIdleQueryMock(),
+    next: vi.fn(next),
+  } as Query;
+}
+
 async function createSession(): Promise<{
   session: AgentSession;
   events: AgentStreamEvent[];
@@ -204,6 +215,42 @@ describe("an external turn reported while the daemon is running its own", () => 
       expect(session.isExternalTurnActive?.()).toBe(false);
     } finally {
       await close();
+    }
+  });
+
+  test("settles a routed SDK stream as accepted when the hook refuses without a result", async () => {
+    let releaseQuery!: () => void;
+    const queryGate = new Promise<void>((resolve) => {
+      releaseQuery = resolve;
+    });
+    let captureStderr: ((data: string) => void) | undefined;
+    const queryFactory = vi.fn(({ options }: { options: { stderr?: (data: string) => void } }) => {
+      captureStderr = options.stderr;
+      return createGatedQueryMock(queryGate);
+    });
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    try {
+      session.noteExternalIdentity?.({ agentId: "agent-routed", labels: { origin: "herdr" } });
+      await session.startTurn("routed message");
+      captureStderr?.(
+        "UserPromptSubmit operation blocked by hook:\n" +
+          "[/hooks/route-phone-message.py]: ⤳\n\n\nOriginal prompt: routed message",
+      );
+      releaseQuery();
+
+      await vi.waitFor(() => {
+        expect(turnEvents(events)).toEqual(["turn_started", "turn_completed", "turn_started"]);
+      });
+      expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    } finally {
+      await session.close();
     }
   });
 });
