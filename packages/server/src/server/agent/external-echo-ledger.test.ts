@@ -11,6 +11,18 @@ describe("normalizeRoutedPromptText", () => {
     expect(normalizeRoutedPromptText("Look at [Image #1] this[Image #2]")).toBe("Look at  this");
   });
 
+  test("drops the pasted_content framing Claude Code puts around a pasted prompt", () => {
+    expect(
+      normalizeRoutedPromptText(
+        '\n\n<pasted_content id="9942">\nfirst paragraph\n\nsecond\n</pasted_content id="9942">',
+      ),
+    ).toBe("first paragraph\n\nsecond");
+  });
+
+  test("applies the paste path's line-ending and tab rewriting", () => {
+    expect(normalizeRoutedPromptText("a\r\nb\tc")).toBe("a\nb    c");
+  });
+
   test("drops the appendix the router adds for attached images", () => {
     const routed =
       "fix the spacing\n\nAttached images (read these files):\n/tmp/prompt-images/a/1-0.png";
@@ -78,6 +90,16 @@ describe("ExternalEchoLedger", () => {
     ledger.record("run the tests");
 
     expect(ledger.consume("run the tests\nand report back")).toBe(true);
+  });
+
+  test("matches a long prompt the pane received as a wrapped paste", () => {
+    const ledger = new ExternalEchoLedger();
+    const prompt = `Ok this is still happening.\n\n${"more detail ".repeat(80)}\n\nThanks`;
+    ledger.record(prompt);
+
+    expect(
+      ledger.consume(`<pasted_content id="9942">\n${prompt}\n</pasted_content id="9942">`),
+    ).toBe(true);
   });
 
   test("records nothing for a prompt with no text", () => {

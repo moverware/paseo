@@ -756,6 +756,17 @@ const LOCAL_COMMAND_STDOUT_PATTERN =
 const CLAUDE_COMMAND_MESSAGE_PATTERN = /<command-message>([\s\S]*?)<\/command-message>/;
 const CLAUDE_COMMAND_ARGS_PATTERN = /<command-args>([\s\S]*?)<\/command-args>/;
 const CLAUDE_COMMAND_NAME_PATTERN = /<command-name>([\s\S]*?)<\/command-name>/;
+/**
+ * Claude Code wraps text that arrived as a terminal paste in id-tagged
+ * `<pasted_content>` blocks before writing the prompt. The tags are framing for
+ * the model, not what the user wrote, so the timeline shows the body alone.
+ */
+const CLAUDE_PASTED_CONTENT_PATTERN =
+  /<pasted_content id="([0-9a-f]{4})">\n?([\s\S]*?)\n?<\/pasted_content id="\1">/g;
+
+export function unwrapClaudePastedContent(text: string): string {
+  return text.replace(CLAUDE_PASTED_CONTENT_PATTERN, (_match, _id, body: string) => body);
+}
 
 function isClaudeLocalCommandStdout(value: unknown): boolean {
   const normalized = normalizeClaudeTranscriptText(value);
@@ -7126,7 +7137,7 @@ function normalizeImportablePromptPreview(text: string): string | null {
 }
 
 function normalizeClaudeUserPromptText(text: string): string | null {
-  const normalized = text.trim();
+  const normalized = unwrapClaudePastedContent(text).trim();
   if (!CLAUDE_COMMAND_MESSAGE_PATTERN.test(normalized)) {
     return normalized || null;
   }

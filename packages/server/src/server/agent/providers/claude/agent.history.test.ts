@@ -16,6 +16,19 @@ describe("extractUserMessageText", () => {
     expect(extractUserMessageText(content)).toBe("First line\n\nSecond line");
   });
 
+  test("shows a pasted prompt without Claude Code's pasted_content framing", () => {
+    const content =
+      'see below\n\n<pasted_content id="9942">\nfirst paragraph\n\nsecond\n</pasted_content id="9942">';
+
+    expect(extractUserMessageText(content)).toBe("see below\n\nfirst paragraph\n\nsecond");
+  });
+
+  test("leaves pasted_content text alone when the closing id does not match", () => {
+    const content = '<pasted_content id="9942">\nbody\n</pasted_content id="abcd">';
+
+    expect(extractUserMessageText(content)).toBe(content);
+  });
+
   test("returns Claude slash command prompts without transcript tags", () => {
     const content =
       "<command-message>diagnose</command-message>\n<command-name>/diagnose</command-name>\n<command-args>recently the PR data does not update</command-args>";

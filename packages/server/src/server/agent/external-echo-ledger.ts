@@ -20,13 +20,19 @@ export function promptEchoText(prompt: AgentPromptInput): string {
 
 /**
  * Strip the decorations a prompt picks up on its way through the external
- * process before comparing it to its echo: inline "[Image #N]" markers (the
- * CLI renders attached image paths as markers, wherever the blocks land) and
- * the router's trailing "Attached images (read these files): …" appendix. What
- * is left is what the user actually typed.
+ * process before comparing it to its echo: Claude Code's `<pasted_content>`
+ * framing and the line-ending and tab rewriting its paste path applies,
+ * inline "[Image #N]" markers (the CLI renders attached image paths as
+ * markers, wherever the blocks land) and the router's trailing "Attached
+ * images (read these files): …" appendix. What is left is what the user
+ * actually typed.
  */
 export function normalizeRoutedPromptText(text: string): string {
-  const withoutMarkers = text.replace(/\[Image #\d+\]/g, "");
+  const withoutMarkers = text
+    .replace(/<\/?pasted_content id="[0-9a-f]{4}">\n?/g, "")
+    .replace(/\r\n|\r/g, "\n")
+    .replaceAll("\t", "    ")
+    .replace(/\[Image #\d+\]/g, "");
   const appendixIndex = withoutMarkers.indexOf("Attached images (read these files):");
   const body = appendixIndex === -1 ? withoutMarkers : withoutMarkers.slice(0, appendixIndex);
   return body.trim();
